@@ -172,7 +172,7 @@ void SetEscSpeed(float value)
 {
     /* 1) Clamp input range */
     if (value < -1.0f) value = -1.0f;
-    if (value >  1.0f) value =  2.0f;
+    if (value >  2.0f) value =  2.0f;
 
     /* 2) Adjust asymmetry:
           Forward (positive) -> halve output
