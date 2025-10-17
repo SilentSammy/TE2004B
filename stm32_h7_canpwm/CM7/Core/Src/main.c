@@ -170,24 +170,35 @@ void Turning_SetAngle(float steer)
 
 void SetEscSpeed(float value)
 {
-    /* 1) Clamp input */
+    /* 1) Clamp input range */
     if (value < -1.0f) value = -1.0f;
-    if (value >  1.0f) value =  1.0f;
+    if (value >  1.0f) value =  2.0f;
 
-    /* 2) Map to pulse width in microseconds */
-    // -1 → 1000 us, 0 → 1500 us, 1 → 2000 us
+    /* 2) Adjust asymmetry:
+          Forward (positive) -> halve output
+          Reverse (negative) -> unchanged */
+    if (value > 0.0f)
+        value *= 0.5f;
+
+    /* 3) Map to pulse width (µs)
+          -1 → 1000 µs
+           0 → 1500 µs
+          +1 → 2000 µs
+    */
     float pulseWidth = 1500.0f + (value * 500.0f);
 
-    /* 3) Convert µs to timer ticks (assuming 1 tick = 1 µs) */
+    /* 4) Convert µs to timer ticks (1 tick = 1 µs assumed) */
     uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim14);
     int32_t ticks = (int32_t)lroundf(pulseWidth);
 
-    /* 4) Clamp and set compare */
+    /* 5) Clamp within timer range */
     if (ticks < 0) ticks = 0;
     if ((uint32_t)ticks > arr) ticks = (int32_t)arr;
 
+    /* 6) Apply PWM */
     __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, (uint32_t)ticks);
 }
+
 
 void StopCarEsc(void)
 {
@@ -287,13 +298,11 @@ void goDistance(float meters, float speed)
 void goDistanceP(float meters, float kP, float maxSpeed)
 {
     const float COUNTS_PER_METER = 16066.0f;
-    const int32_t DEADBAND = 100;  // counts
-
-    int32_t targetCounts = (int32_t)(meters * COUNTS_PER_METER);
+    const int32_t DEADBAND = 50;     // counts
+    const float MIN_THROTTLE = 0.08f; // minimum throttle magnitude
 
     printf("\n\r=== Move %.2f m (kP=%.3f, maxSpeed=%.2f) ===\n\r",
            meters, kP, maxSpeed);
-    printf("Target counts: %ld\n\r", (long)targetCounts);
 
     // Ensure car is stopped and ESC armed
     printf("Ensuring vehicle is stopped...\n\r");
@@ -307,13 +316,16 @@ void goDistanceP(float meters, float kP, float maxSpeed)
 
     while (1)
     {
+        // Recalculate target dynamically (for debugger tuning)
+        int32_t targetCounts = (int32_t)(meters * COUNTS_PER_METER);
+
         int32_t current = readEncoder(-1);
         int32_t delta   = current - startCount;
         int32_t error   = targetCounts - delta;
 
         float speedCmd = 0.0f;
 
-        // Only correct if outside deadband
+        // Apply proportional control only outside deadband
         if (error > DEADBAND)
             speedCmd =  kP * error;
         else if (error < -DEADBAND)
@@ -321,21 +333,25 @@ void goDistanceP(float meters, float kP, float maxSpeed)
         else
             speedCmd = 0.0f;
 
-        // Clamp speed
-        if (speedCmd > maxSpeed)  speedCmd = maxSpeed;
+        // Clamp to max speed
+        if (speedCmd >  maxSpeed) speedCmd =  maxSpeed;
         if (speedCmd < -maxSpeed) speedCmd = -maxSpeed;
+
+        // Enforce minimum throttle (only if nonzero command)
+        if (speedCmd > 0 && speedCmd <  MIN_THROTTLE) speedCmd =  MIN_THROTTLE;
+        if (speedCmd < 0 && speedCmd > -MIN_THROTTLE) speedCmd = -MIN_THROTTLE;
 
         SetEscSpeed(speedCmd);
 
-        // Minimal print every 500 ms
-        if (HAL_GetTick() - lastPrint >= 500)
+        // Periodic debug print
+        if (HAL_GetTick() - lastPrint >= 250)
         {
             printf("Δ=%ld | err=%ld | cmd=%.3f\n\r",
                    (long)delta, (long)error, speedCmd);
             lastPrint = HAL_GetTick();
         }
 
-        // No delay — run at max loop rate
+        // No delay — tight control loop
     }
 }
 
@@ -420,7 +436,8 @@ Error_Handler();
   HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
   Turning_SetAngle(0);
 //  goDistance(1, 0.5);
-  goDistanceP(1, 0.00125, 0.5);
+//  goDistanceP(0.4, 0.001, 0.6);
+  debugSetup();
 //  debugSetup();
   /* USER CODE END 2 */
 
