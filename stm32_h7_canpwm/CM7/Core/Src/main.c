@@ -23,6 +23,8 @@
 /* USER CODE BEGIN Includes */
 #include "myprintf.h"
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,6 +52,7 @@ FDCAN_HandleTypeDef hfdcan1;
 TIM_HandleTypeDef htim13;
 TIM_HandleTypeDef htim14;
 
+UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
@@ -68,6 +71,7 @@ static void MX_USART3_UART_Init(void);
 static void MX_FDCAN1_Init(void);
 static void MX_TIM13_Init(void);
 static void MX_TIM14_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -198,7 +202,6 @@ void SetEscSpeed(float value)
     /* 6) Apply PWM */
     __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, (uint32_t)ticks);
 }
-
 
 void StopCarEsc(void)
 {
@@ -355,7 +358,6 @@ void goDistanceP(float meters, float kP, float maxSpeed)
     }
 }
 
-
 void debugSetup() {
 	float dbg_spd = 0.5f;
 	float dbg_str = 0.0f;
@@ -365,6 +367,109 @@ void debugSetup() {
 		Turning_SetAngle(dbg_str);
 		StopCarEsc();
 	}
+}
+
+void echoTest() {
+  while (1) {
+	  uint8_t rx_data;
+	  if (HAL_UART_Receive(&huart3, &rx_data, 1, 10) == HAL_OK) {
+		HAL_UART_Transmit(&huart3, &rx_data, 1, HAL_MAX_DELAY);
+	  }
+  }
+}
+
+void dualEchoTest(void) {
+  uint8_t rx_data;
+
+  while (1) {
+    // From USB Serial (USART3)
+    if (HAL_UART_Receive(&huart3, &rx_data, 1, 10) == HAL_OK) {
+      HAL_UART_Transmit(&huart3, &rx_data, 1, HAL_MAX_DELAY);
+      HAL_UART_Transmit(&huart2, &rx_data, 1, HAL_MAX_DELAY);
+    }
+
+    // From Bluetooth (USART2)
+    if (HAL_UART_Receive(&huart2, &rx_data, 1, 10) == HAL_OK) {
+      HAL_UART_Transmit(&huart3, &rx_data, 1, HAL_MAX_DELAY);
+      HAL_UART_Transmit(&huart2, &rx_data, 1, HAL_MAX_DELAY);
+    }
+  }
+}
+
+// --- Dual Serial Wrappers ---
+void serialPrint(const char *msg)
+{
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+void serialPrintln(const char *msg)
+{
+    serialPrint(msg);
+    serialPrint("\r\n");
+}
+
+char serialRead(void)
+{
+    uint8_t ch;
+    if (HAL_UART_Receive(&huart3, &ch, 1, 0) == HAL_OK) return ch;
+    if (HAL_UART_Receive(&huart2, &ch, 1, 0) == HAL_OK) return ch;
+    return 0;
+}
+
+// --- Control code ---
+void decodeDirection(char input, int8_t *throttle, int8_t *steering)
+{
+    switch (input) {
+        case 'F': *throttle =  1; *steering =  0; break;  // Forward
+        case 'B': *throttle = -1; *steering =  0; break;  // Backward
+        case 'L': *throttle =  0; *steering = -1; break;  // Left
+        case 'R': *throttle =  0; *steering =  1; break;  // Right
+        case 'G': *throttle =  1; *steering = -1; break;  // Forward + Left
+        case 'H': *throttle =  1; *steering =  1; break;  // Forward + Right
+        case 'I': *throttle = -1; *steering = -1; break;  // Backward + Left
+        case 'J': *throttle = -1; *steering =  1; break;  // Backward + Right
+        case 'S': *throttle =  0; *steering =  0; break;  // Stop
+        default: break;
+    }
+}
+
+void decodeSpeedChar(char input, float *speed)
+{
+    if (input >= '0' && input <= '9') {
+        int digit = input - '0';
+        *speed = (digit + 1) / 10.0f;   // '0'–'9' -> 0.1–1.0
+    }
+}
+
+void controlLoop(void)
+{
+    int8_t throttle = 0;
+    int8_t steering = 0;
+    float speed = 1.0f;   // throttle multiplier
+    char msg[64];
+    char cmd;
+
+    while (1)
+    {
+        cmd = serialRead();
+        if (cmd) {
+            decodeDirection(cmd, &throttle, &steering);
+            decodeSpeedChar(cmd, &speed);
+
+            // Scale throttle to ±2.0, steering fixed to ±0.5
+            float appliedThrottle = throttle * speed * 2.0f;
+            float appliedSteering = steering * 0.5f;
+
+            SetEscSpeed(appliedThrottle);
+            Turning_SetAngle(appliedSteering);
+
+            int len = snprintf(msg, sizeof(msg),
+                               "Cmd:%c | Th:%.2f | St:%.2f | Spd:%.1f\r\n",
+                               cmd, appliedThrottle, appliedSteering, speed);
+            HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
+        }
+    }
 }
 
 /* USER CODE END 0 */
@@ -431,14 +536,17 @@ Error_Handler();
   MX_FDCAN1_Init();
   MX_TIM13_Init();
   MX_TIM14_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim13, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
   Turning_SetAngle(0);
 //  goDistance(1, 0.5);
 //  goDistanceP(0.4, 0.001, 0.6);
-  debugSetup();
 //  debugSetup();
+//  echoTest();
+//  dualEchoTest();
+  controlLoop();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -694,6 +802,54 @@ static void MX_TIM14_Init(void)
 }
 
 /**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 9600;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
   * @brief USART3 Initialization Function
   * @param None
   * @retval None
@@ -757,9 +913,9 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LD1_Pin|LD2_Pin, GPIO_PIN_RESET);
