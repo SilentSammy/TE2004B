@@ -467,8 +467,24 @@ void controlLoop(void)
             int len = snprintf(msg, sizeof(msg),
                                "Cmd:%c | Th:%.2f | St:%.2f | Spd:%.1f\r\n",
                                cmd, appliedThrottle, appliedSteering, speed);
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, HAL_MAX_DELAY);
             HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
+
         }
+    }
+}
+
+void helloWorldLoop(void)
+{
+    const char *msg = "Hello World\r\n";
+
+    while (1)
+    {
+        // Send to both UARTs
+        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+        HAL_Delay(1000);  // wait 1 second
     }
 }
 
@@ -547,6 +563,7 @@ Error_Handler();
 //  echoTest();
 //  dualEchoTest();
   controlLoop();
+//  helloWorldLoop();
   /* USER CODE END 2 */
 
   /* Infinite loop */
