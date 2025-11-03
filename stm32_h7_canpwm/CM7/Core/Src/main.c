@@ -23,7 +23,6 @@
 /* USER CODE BEGIN Includes */
 #include "myprintf.h"
 #include <stdbool.h>
-#include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -148,6 +147,39 @@ int32_t readEncoder(int32_t timeoutMs /* = -1 */)
 
     return lastPosition;
 }
+
+void loopPrintEncoder(void)
+{
+    const uint32_t printIntervalMs = 100;   // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[Encoder Monitor] Starting...\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // 1) Periodically read encoder value
+        if (now - lastPrint >= printIntervalMs)
+        {
+            int32_t encoderCount = readEncoder(-1);
+            printf("Encoder: %ld\n\r", (long)encoderCount);
+            lastPrint = now;
+        }
+
+        // 2) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Encoder Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
 
 void Turning_SetAngle(float steer)
 {
@@ -301,7 +333,7 @@ void goDistance(float meters, float speed)
 void goDistanceP(float meters, float kP, float maxSpeed)
 {
     const float COUNTS_PER_METER = 16066.0f;
-    const int32_t DEADBAND = 50;     // counts
+    const int32_t DEADBAND = 100;     // counts
     const float MIN_THROTTLE = 0.08f; // minimum throttle magnitude
 
     printf("\n\r=== Move %.2f m (kP=%.3f, maxSpeed=%.2f) ===\n\r",
@@ -363,6 +395,7 @@ void debugSetup() {
 	float dbg_str = 0.0f;
 
 	while (1) {
+		int32_t current = readEncoder(-1);
 		SetEscSpeed(dbg_spd);
 		Turning_SetAngle(dbg_str);
 		StopCarEsc();
@@ -488,6 +521,196 @@ void helloWorldLoop(void)
     }
 }
 
+float pidDistance(float error, float Kp, float Ki, float Kd, float outMin, float outMax)
+{
+    static float integral = 0.0f;
+    static float prevError = 0.0f;
+    static uint32_t lastTick = 0;
+
+    uint32_t now = HAL_GetTick();
+    float dt = 0.0f;
+
+    if (lastTick == 0)
+    {
+        // first call
+        lastTick = now;
+        prevError = error;
+        return 0.0f;
+    }
+
+    dt = (now - lastTick) / 1000.0f; // ms → seconds
+    lastTick = now;
+
+    // Protect against absurd dt (e.g., after pause)
+    if (dt <= 0.0f || dt > 1.0f)
+        dt = 0.01f;
+
+    // --- PID calculation ---
+    integral += error * dt;
+    float derivative = (error - prevError) / dt;
+
+    float output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+
+    // Clamp output
+    if (output >  outMax) output =  outMax;
+    if (output < outMin) output = outMin;
+
+    prevError = error;
+    return output;
+}
+
+void goDistancePID_live(void)
+{
+    // --- CONFIGURABLE PARAMETERS (editable live in debugger) ---
+    UART_HandleTypeDef *uart = &huart3;  // switch UART here
+
+    float Kp = 0.001f;   // proportional gain
+    float Ki = 0.0f;   // integral gain
+    float Kd = 0.0f;   // derivative gain
+    float maxSpeed = 0.5f; // output saturation (ESC command)
+    float minThrottle = 0.0f;
+    int32_t deadband = 100;
+    const float COUNTS_PER_METER = 16066.0f;
+
+    // --- INTERNAL STATE ---
+    float targetMeters = 0.0f;
+    char rxBuf[32];
+    int rxIndex = 0;
+    char msg[128];
+    int len;
+
+    const uint32_t PRINT_INTERVAL_MS = 250;
+    uint32_t lastPrint = HAL_GetTick();
+    int printEnabled = 1;
+
+    SetEscSpeed(0.0f);
+    HAL_Delay(1000);
+
+    len = snprintf(msg, sizeof(msg),
+                   "\n\r=== Live PID Distance Control ===\n\r"
+                   "Type a distance (m) + ENTER to update target.\n\r");
+    HAL_UART_Transmit(uart, (uint8_t*)msg, len, HAL_MAX_DELAY);
+
+    int32_t startCount = readEncoder(-1);
+
+    while (1)
+    {
+        // --- UART input handling ---
+        uint8_t ch;
+        if (HAL_UART_Receive(uart, &ch, 1, 0) == HAL_OK)
+        {
+            // Echo typed character
+            HAL_UART_Transmit(uart, &ch, 1, HAL_MAX_DELAY);
+
+            if (ch == '\r' || ch == '\n')
+            {
+                rxBuf[rxIndex] = '\0';
+                if (rxIndex > 0)
+                {
+                    float newTarget;
+                    if (sscanf(rxBuf, "%f", &newTarget) == 1)
+                    {
+                        targetMeters = newTarget;
+                        len = snprintf(msg, sizeof(msg),
+                                       "\n\r[Target: %.3f m]\n\r", targetMeters);
+                        HAL_UART_Transmit(uart, (uint8_t*)msg, len, HAL_MAX_DELAY);
+                    }
+                    else
+                    {
+                        const char invalidMsg[] = "\n\r[Invalid input]\n\r";
+                        HAL_UART_Transmit(uart, (uint8_t*)invalidMsg,
+                                          strlen(invalidMsg), HAL_MAX_DELAY);
+                    }
+                    rxIndex = 0;
+                }
+            }
+            else if (rxIndex < (int)sizeof(rxBuf) - 1)
+            {
+                rxBuf[rxIndex++] = ch;
+            }
+        }
+
+        // --- Encoder + error calculation ---
+        int32_t targetCounts = (int32_t)(targetMeters * COUNTS_PER_METER);
+        int32_t current = readEncoder(-1);
+        int32_t delta   = current - startCount;
+        int32_t error   = targetCounts - delta;
+
+        // --- PID control output ---
+        float speedCmd = 0.0f;
+
+        if (error >  deadband || error < -deadband)
+            speedCmd = pidDistance((float)error, Kp, Ki, Kd, -maxSpeed, maxSpeed);
+        else
+            speedCmd = 0.0f;
+
+        // --- Minimum throttle enforcement ---
+        if (speedCmd > 0 && speedCmd <  minThrottle) speedCmd =  minThrottle;
+        if (speedCmd < 0 && speedCmd > -minThrottle) speedCmd = -minThrottle;
+
+        SetEscSpeed(speedCmd);
+
+        // --- Smarter print logic ---
+        if (HAL_GetTick() - lastPrint >= PRINT_INTERVAL_MS)
+        {
+            lastPrint = HAL_GetTick();
+
+            if (speedCmd != 0.0f || error > deadband || error < -deadband)
+            {
+                printEnabled = 1;
+                len = snprintf(msg, sizeof(msg),
+                               "Δ=%ld e=%ld u=%.2f\r\n",
+                               (long)delta, (long)error, speedCmd);
+                HAL_UART_Transmit(uart, (uint8_t*)msg, len, HAL_MAX_DELAY);
+            }
+            else if (printEnabled)
+            {
+                const char doneMsg[] = "[At target]\r\n";
+                HAL_UART_Transmit(uart, (uint8_t*)doneMsg, strlen(doneMsg), HAL_MAX_DELAY);
+                printEnabled = 0;
+            }
+        }
+    }
+}
+
+void loopPrintAllCAN(void)
+{
+    FDCAN_RxHeaderTypeDef RxHeader;
+    uint8_t RxData[8];
+    const uint32_t heartbeatIntervalMs = 1000;  // heartbeat every 1s
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[CAN Monitor] Listening for messages...\n\r");
+
+    while (1)
+    {
+        // 1) Check for incoming CAN message
+        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
+        {
+            printf("ID: 0x%03lX | Type: %s | DLC: %d | Data:",
+                   (long)RxHeader.Identifier,
+                   (RxHeader.IdType == FDCAN_STANDARD_ID ? "STD" : "EXT"),
+                   (int)(RxHeader.DataLength >> 16));
+
+            for (int i = 0; i < (RxHeader.DataLength >> 16); i++)
+                printf(" %02X", RxData[i]);
+
+            printf("\n\r");
+        }
+
+        // 2) Heartbeat check
+        uint32_t now = HAL_GetTick();
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[CAN Monitor] Heartbeat... system alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);  // avoid 100% CPU usage
+    }
+}
+
+
 /* USER CODE END 0 */
 
 /**
@@ -558,12 +781,15 @@ Error_Handler();
   HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
   Turning_SetAngle(0);
 //  goDistance(1, 0.5);
-//  goDistanceP(0.4, 0.001, 0.6);
+//  loopPrintEncoder();
+//  goDistanceP(1, 0.001, 0.6);
 //  debugSetup();
-//  echoTest();
+  echoTest();
 //  dualEchoTest();
-  controlLoop();
+//  controlLoop();
 //  helloWorldLoop();
+//  goDistancePID_live();
+//  loopPrintAllCAN();
   /* USER CODE END 2 */
 
   /* Infinite loop */
