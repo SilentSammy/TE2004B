@@ -1,5 +1,5 @@
 Common/Src/system_stm32h7xx_dualcore_boot_cm4_cm7.o: \
- C:/Users/SAMMY_LOQ/STM32CubeIDE/workspace_1.19.0/stm32_h7_uart-test/Common/Src/system_stm32h7xx_dualcore_boot_cm4_cm7.c \
+ C:/Users/SAMMY_LOQ/STM32CubeIDE/workspace_1.19.0/TE2004B/stm32_h7_uart-test/Common/Src/system_stm32h7xx_dualcore_boot_cm4_cm7.c \
  ../../Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h7xx.h \
  ../../Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h745xx.h \
  ../../Drivers/CMSIS/Include/core_cm7.h \

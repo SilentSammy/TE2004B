@@ -84,6 +84,7 @@ NVIC1.PendSV_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
 NVIC1.PriorityGroup=NVIC_PRIORITYGROUP_4
 NVIC1.SVCall_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
 NVIC1.SysTick_IRQn=true\:15\:0\:false\:false\:true\:false\:true\:false
+NVIC1.USART2_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
 NVIC1.USART3_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
 NVIC1.UsageFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
 NVIC2.BusFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
