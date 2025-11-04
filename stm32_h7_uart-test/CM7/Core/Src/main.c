@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#define UART_MAILBOX_IMPL     // <-- defines the implementation once
+#include "uart_mailbox.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -79,131 +81,18 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-#include <string.h>
-
-// ================================
-// Mailboxes: per-UART RX buffers
-// ================================
-#define RX_RB_SZ        512          // ring buffer size per mailbox
-#define RX_CHUNK_SZ      64          // size passed to ReceiveToIdle_IT
-#define UART_MB_MAX       4          // how many UARTs you plan to register
-
-typedef struct {
-    UART_HandleTypeDef *huart;                   // which UART this mailbox belongs to
-    uint8_t            rxChunk[RX_CHUNK_SZ];     // staging buffer used by HAL
-    volatile uint8_t   rb[RX_RB_SZ];             // ring buffer
-    volatile uint16_t  head;
-    volatile uint16_t  tail;
-    volatile uint32_t  dropped;                  // optional: count dropped bytes on overflow
-} uart_mb_t;
-
-// Registry of mailboxes
-static uart_mb_t g_mailboxes[UART_MB_MAX];
-static uint32_t  g_mb_count = 0;
-
-// A convenient global mailbox pointer you can use from main/echo()
-static uart_mb_t *g_mb = NULL;
-
-// ---------------------------------
-// Ring buffer helpers (per mailbox)
-// ---------------------------------
-static inline int mb_rb_put(uart_mb_t *mb, uint8_t b) {
-    uint16_t next = (uint16_t)((mb->head + 1U) % RX_RB_SZ);
-    if (next == mb->tail) { mb->dropped++; return 0; }  // full
-    mb->rb[mb->head] = b;
-    mb->head = next;
-    return 1;
-}
-
-static inline int mb_rb_get(uart_mb_t *mb, uint8_t *b) {
-    if (mb->head == mb->tail) return 0;                 // empty
-    *b = mb->rb[mb->tail];
-    mb->tail = (uint16_t)((mb->tail + 1U) % RX_RB_SZ);
-    return 1;
-}
-
-// ---------------------------------
-// Registry utilities
-// ---------------------------------
-static uart_mb_t* uart_mb_find(UART_HandleTypeDef *huart) {
-    for (uint32_t i = 0; i < g_mb_count; ++i) {
-        if (g_mailboxes[i].huart == huart) return &g_mailboxes[i];
-    }
-    return NULL;
-}
-
-// Register a UART into the mailbox system and start idle reception.
-// Returns pointer to mailbox via out_mb; returns 0 on success, -1 on error.
-int uart_mb_register(UART_HandleTypeDef *huart, uart_mb_t **out_mb) {
-    // Already registered?
-    uart_mb_t *existing = uart_mb_find(huart);
-    if (existing) {
-        if (out_mb) *out_mb = existing;
-        // re-arm in case caller wants to ensure it's active
-        HAL_UARTEx_ReceiveToIdle_IT(existing->huart, existing->rxChunk, sizeof(existing->rxChunk));
-        return 0;
-    }
-
-    if (g_mb_count >= UART_MB_MAX) return -1;
-
-    uart_mb_t *mb = &g_mailboxes[g_mb_count++];
-    memset((void*)mb, 0, sizeof(*mb));
-    mb->huart = huart;
-
-    // Kick off idle reception for this UART
-    HAL_UARTEx_ReceiveToIdle_IT(mb->huart, mb->rxChunk, sizeof(mb->rxChunk));
-
-    if (out_mb) *out_mb = mb;
-    return 0;
-}
-
-// ---------------------------------
-// HAL callbacks (shared)
-// ---------------------------------
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
-    uart_mb_t *mb = uart_mb_find(huart);
-    if (!mb || Size == 0) return;
-
-    // Copy the received chunk into the mailbox ring buffer
-    for (uint16_t i = 0; i < Size; ++i) {
-        (void)mb_rb_put(mb, mb->rxChunk[i]);
-    }
-
-    // Re-arm
-    HAL_UARTEx_ReceiveToIdle_IT(mb->huart, mb->rxChunk, sizeof(mb->rxChunk));
-}
-
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
-    uart_mb_t *mb = uart_mb_find(huart);
-    if (!mb) return;
-
-    __HAL_UART_CLEAR_OREFLAG(huart);
-    HAL_UARTEx_ReceiveToIdle_IT(mb->huart, mb->rxChunk, sizeof(mb->rxChunk));
-}
-
 // ---------------------------------
 // Simple echo demo using the global mailbox
 // ---------------------------------
 void echo(void) {
-    if (!g_mb) {
-        const char *err = "No mailbox registered. Call uart_mb_register(&huart3, &g_mb) first.\r\n";
-        // Try a best-effort TX on USART3 if available
-        HAL_UART_Transmit(&huart3, (uint8_t*)err, strlen(err), 50);
-        return;
-    }
-
     const char *hello = "Mailbox echo ready\r\n";
     HAL_UART_Transmit(g_mb->huart, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
 
     uint8_t b;
     for (;;) {
-        // Drain all bytes received for this mailbox
-        while (mb_rb_get(g_mb, &b)) {
+        while (uart_mb_get(g_mb, &b)) {
             HAL_UART_Transmit(g_mb->huart, &b, 1, HAL_MAX_DELAY);
         }
-
-        // Simulate other processing; RX continues in background
         HAL_Delay(2);
     }
 }
@@ -283,7 +172,7 @@ Error_Handler();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 //  HAL_UART_IRQHandler(&huart3);
-  uart_mb_register(&huart2, &g_mb);  // choose which UART feeds the global mailbox
+  uart_mb_register(&huart3, &g_mb);  // choose which UART feeds the global mailbox
   echo();                             // loop drains g_mb and echoes everything
 //  hello();
   /* USER CODE END 2 */
