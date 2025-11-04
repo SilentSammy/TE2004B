@@ -24,6 +24,7 @@
 #include "myprintf.h"
 #include <stdbool.h>
 #include <string.h>
+#include <ctype.h>
 #define UART_MAILBOX_IMPL     // <-- defines the implementation once
 #include "uart_mailbox.h"
 /* USER CODE END Includes */
@@ -79,6 +80,31 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// COMMANDS
+#ifndef CMD_BUF_SZ
+#define CMD_BUF_SZ 128
+#endif
+#define MAX_ARGS 8
+typedef void (*CommandHandler)(char **args, int argc);
+typedef struct {
+    const char *name;
+    CommandHandler handler;
+} CommandEntry;
+typedef struct {
+    CommandHandler handler;
+    char *args[MAX_ARGS];
+    int argc;
+    bool valid;
+} ParsedCommand;
+void handleToggle(char **args, int argc)
+{
+    HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
+}
+const CommandEntry commandTable[] = {
+    { "TOGGLE", handleToggle },
+};
+#define NUM_COMMANDS (sizeof(commandTable) / sizeof(commandTable[0]))
+
 // CAN FUNCTIONS
 void loopPrintAllCAN(void)
 {
@@ -551,6 +577,67 @@ void goDistancePID_live(void)
 }
 
 // SERIAL COMMS
+ParsedCommand parseCommandLine(char *input, const CommandEntry *table, int tableSize)
+{
+    ParsedCommand result = {0};
+    result.valid = false;
+
+    if (!input || *input == '\0')
+        return result;
+
+    // Trim leading spaces
+    while (isspace((unsigned char)*input)) input++;
+    if (*input == '\0')
+        return result;
+
+    // Find the function name / argument separator
+    char *colon = strchr(input, ':');
+    char *funcEnd = colon ? colon : input + strlen(input);
+
+    // Extract command name
+    *funcEnd = '\0';
+    for (char *p = input; *p; ++p)
+        *p = toupper((unsigned char)*p);
+
+    // Look up the handler
+    for (int i = 0; i < tableSize; i++) {
+        if (strcmp(table[i].name, input) == 0) {
+            result.handler = table[i].handler;
+            result.valid = true;
+            break;
+        }
+    }
+
+    if (!result.valid)
+        return result;  // unknown command
+
+    // No colon? → no arguments
+    if (!colon)
+        return result;
+
+    // Parse arguments after the colon
+    char *argString = colon + 1;
+    int argc = 0;
+
+    while (argc < MAX_ARGS) {
+        // Find next comma or end
+        char *comma = strchr(argString, ',');
+        if (comma)
+            *comma = '\0';
+
+        // Trim spaces
+        while (isspace((unsigned char)*argString)) argString++;
+        if (*argString)
+            result.args[argc++] = argString;
+
+        if (!comma)
+            break;  // no more commas
+        argString = comma + 1;
+    }
+
+    result.argc = argc;
+    return result;
+}
 void decodeDirection(char input, int8_t *throttle, int8_t *steering)
 {
     switch (input) {
@@ -574,39 +661,6 @@ void decodeSpeedChar(char input, float *speed)
         *speed = (digit + 1) / 10.0f;   // '0'–'9' -> 0.1–1.0
     }
 }
-
-void controlLoop(void)
-{
-    int8_t throttle = 0;
-    int8_t steering = 0;
-    float speed = 1.0f;   // throttle multiplier
-    char msg[64];
-    char cmd;
-
-    while (1)
-    {
-        cmd = serialRead();
-        if (cmd) {
-            decodeDirection(cmd, &throttle, &steering);
-            decodeSpeedChar(cmd, &speed);
-
-            // Scale throttle to ±2.0, steering fixed to ±0.5
-            float appliedThrottle = throttle * speed * 2.0f;
-            float appliedSteering = steering * 0.5f;
-
-            SetEscSpeed(appliedThrottle);
-            Turning_SetAngle(appliedSteering);
-
-            int len = snprintf(msg, sizeof(msg),
-                               "Cmd:%c | Th:%.2f | St:%.2f | Spd:%.1f\r\n",
-                               cmd, appliedThrottle, appliedSteering, speed);
-            HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, HAL_MAX_DELAY);
-            HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
-
-        }
-    }
-}
-
 void echo() {
 	uart_mb_t *mb = g_mb;
     const char *hello = "Mailbox echo ready\r\n";
@@ -628,6 +682,91 @@ void echo_all(void) {
         }
         HAL_Delay(2);
     }
+}
+static void processShortCmd(uint8_t cmd)
+{
+    static int8_t throttle = 0;
+    static int8_t steering = 0;
+    static float speed = 1.0f;   // throttle multiplier
+    char msg[64];
+
+    decodeDirection(cmd, &throttle, &steering);
+    decodeSpeedChar(cmd, &speed);
+
+    // Scale throttle to ±2.0, steering fixed to ±0.5
+    float appliedThrottle = throttle * speed * 2.0f;
+    float appliedSteering = steering * 0.5f;
+
+    SetEscSpeed(appliedThrottle);
+    Turning_SetAngle(appliedSteering);
+
+    int len = snprintf(msg, sizeof(msg),
+                       "Cmd:%c | Th:%.2f | St:%.2f | Spd:%.1f\r\n",
+                       cmd, appliedThrottle, appliedSteering, speed);
+
+    uart_mb_send_all((uint8_t*)msg, len, HAL_MAX_DELAY);
+}
+static void processLongCmd(const uint8_t *buf, size_t len)
+{
+    // 1) Make a mutable, NUL-terminated copy for parseCommandLine()
+    char line[CMD_BUF_SZ + 1];
+    if (len > CMD_BUF_SZ) len = CMD_BUF_SZ;      // clamp
+    memcpy(line, buf, len);
+    line[len] = '\0';
+
+    // 2) Parse: NAME[:arg1,arg2,...]
+    ParsedCommand pc = parseCommandLine(line, commandTable, (int)NUM_COMMANDS);
+
+    // 3) Dispatch or report error
+    if (pc.valid && pc.handler) {
+        pc.handler(pc.args, pc.argc);
+    } else {
+        char msg[64];
+        int n = snprintf(msg, sizeof(msg), "ERR:UNKNOWN_CMD\r\n");
+        uart_mb_send_all((uint8_t*)msg, (uint16_t)n, HAL_MAX_DELAY);
+    }
+}
+void commandLoop(void)
+{
+    static uint8_t  collecting = 0;
+    static uint16_t cmdLen = 0;
+    static uint8_t  cmdBuf[CMD_BUF_SZ];
+
+    uint8_t b;
+
+    for (;;)
+    {
+        while (uart_mb_get_any(&b))
+        {
+            if (!collecting) {
+                if (b == '#') {
+                    collecting = 1;
+                    cmdLen = 0;
+                } else if (b != ';') {
+                    processShortCmd(b);
+                }
+            } else {
+                if (b == ';') {
+                    if (cmdLen > 0) processLongCmd(cmdBuf, cmdLen);
+                    collecting = 0;
+                    cmdLen = 0;
+                } else {
+                    if (cmdLen < CMD_BUF_SZ) {
+                        cmdBuf[cmdLen++] = b;
+                    } else {
+                        // Overflow policy: flush current chunk then continue
+                        processLongCmd(cmdBuf, cmdLen);
+                        cmdLen = 0;
+                        cmdBuf[cmdLen++] = b;
+                    }
+                }
+            }
+        }
+        HAL_Delay(2);
+    }
+}
+static inline void send_line_all(const char *s) {
+    uart_mb_send_all((const uint8_t*)s, (uint16_t)strlen(s), HAL_MAX_DELAY);
 }
 
 /* USER CODE END 0 */
@@ -701,7 +840,8 @@ Error_Handler();
   Turning_SetAngle(0);
   uart_mb_register(&huart3, &g_mb);  // choose which UART feeds the global mailbox
   uart_mb_register(&huart2, NULL);
-  echo_all();
+//  echo_all();
+  commandLoop();
   /* USER CODE END 2 */
 
   /* Infinite loop */
