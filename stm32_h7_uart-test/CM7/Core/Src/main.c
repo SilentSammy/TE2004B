@@ -64,7 +64,7 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-
+static uart_mb_t *g_mb = NULL;   // <-- app-owned “global”
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -81,17 +81,15 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// ---------------------------------
-// Simple echo demo using the global mailbox
-// ---------------------------------
-void echo(void) {
+void echo() {
+	uart_mb_t *mb = g_mb;
     const char *hello = "Mailbox echo ready\r\n";
-    HAL_UART_Transmit(g_mb->huart, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
+    HAL_UART_Transmit(mb->huart, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
 
     uint8_t b;
     for (;;) {
-        while (uart_mb_get(g_mb, &b)) {
-            HAL_UART_Transmit(g_mb->huart, &b, 1, HAL_MAX_DELAY);
+        while (uart_mb_get(mb, &b)) {
+            HAL_UART_Transmit(mb->huart, &b, 1, HAL_MAX_DELAY);
         }
         HAL_Delay(2);
     }

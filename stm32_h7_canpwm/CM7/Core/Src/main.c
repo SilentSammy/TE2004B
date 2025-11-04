@@ -24,6 +24,8 @@
 #include "myprintf.h"
 #include <stdbool.h>
 #include <string.h>
+#define UART_MAILBOX_IMPL     // <-- defines the implementation once
+#include "uart_mailbox.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,7 +62,7 @@ FDCAN_TxHeaderTypeDef TxHeader;
 FDCAN_RxHeaderTypeDef RxHeader;
 uint8_t TxData[8] = {0x10, 0x34, 0x54, 0x76, 0x98, 0x00, 0x11, 0x22};
 uint8_t RxData[8];
-
+static uart_mb_t *g_mb = NULL;   // <-- app-owned “global”
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,6 +79,43 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// CAN FUNCTIONS
+void loopPrintAllCAN(void)
+{
+    FDCAN_RxHeaderTypeDef RxHeader;
+    uint8_t RxData[8];
+    const uint32_t heartbeatIntervalMs = 1000;  // heartbeat every 1s
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[CAN Monitor] Listening for messages...\n\r");
+
+    while (1)
+    {
+        // 1) Check for incoming CAN message
+        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
+        {
+            printf("ID: 0x%03lX | Type: %s | DLC: %d | Data:",
+                   (long)RxHeader.Identifier,
+                   (RxHeader.IdType == FDCAN_STANDARD_ID ? "STD" : "EXT"),
+                   (int)(RxHeader.DataLength >> 16));
+
+            for (int i = 0; i < (RxHeader.DataLength >> 16); i++)
+                printf(" %02X", RxData[i]);
+
+            printf("\n\r");
+        }
+
+        // 2) Heartbeat check
+        uint32_t now = HAL_GetTick();
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[CAN Monitor] Heartbeat... system alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);  // avoid 100% CPU usage
+    }
+}
 int32_t readEncoder(int32_t timeoutMs /* = -1 */)
 {
     static int32_t lastPosition = 0;
@@ -147,7 +186,6 @@ int32_t readEncoder(int32_t timeoutMs /* = -1 */)
 
     return lastPosition;
 }
-
 void loopPrintEncoder(void)
 {
     const uint32_t printIntervalMs = 100;   // print every 100 ms
@@ -180,7 +218,7 @@ void loopPrintEncoder(void)
     }
 }
 
-
+// MOTORS AND SERVOS
 void Turning_SetAngle(float steer)
 {
     /* 0) Preprocess normalized input (-1..1) → (-90..90 degrees) */
@@ -203,7 +241,6 @@ void Turning_SetAngle(float steer)
     /* 4) Write compare register */
     __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
 }
-
 void SetEscSpeed(float value)
 {
     /* 1) Clamp input range */
@@ -234,51 +271,23 @@ void SetEscSpeed(float value)
     /* 6) Apply PWM */
     __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, (uint32_t)ticks);
 }
-
 void StopCarEsc(void)
 {
     SetEscSpeed(0.0f);   // Neutral = 1500 µs pulse
 }
+void debugSetup() {
+	float dbg_spd = 0.5f;
+	float dbg_str = 0.0f;
 
-void encoderTest(float speed, uint32_t runtimeMs, uint32_t setupDelayMs)
-{
-    printf("\n\r=== Encoder Test Start ===\n\r");
-    printf("Placing car... waiting %lu ms\n\r", (unsigned long)setupDelayMs);
-    HAL_Delay(setupDelayMs);
-
-    // 1) Read initial encoder count
-    int32_t startCount = readEncoder(-1);
-    printf("Start encoder count: %ld\n\r", (long)startCount);
-
-    // 2) Run motor at given speed
-    int speedScaled = (int)(speed * 100);  // e.g. 0.5 -> 50
-    printf("Running motor at %d/100 for %lu ms...\n\r",
-           speedScaled, (unsigned long)runtimeMs);
-
-    SetEscSpeed(speed);
-    HAL_Delay(runtimeMs);
-
-    // 3) Stop and wait 2s for car to settle
-    StopCarEsc();
-    printf("Motor stopped, waiting 2s to settle...\n\r");
-    HAL_Delay(2000);
-
-    // 4) Read final encoder count
-    int32_t finalCount = readEncoder(-1);
-    int32_t diff = finalCount - startCount;
-    printf("Final encoder count: %ld | Δ = %ld\n\r",
-           (long)finalCount, (long)diff);
-
-    // 5) Infinite loop reporting live encoder readings
-    printf("\n\r=== Holding results ===\n\r");
-    while (1)
-    {
-        int32_t current = readEncoder(-1);
-        printf("Start: %ld | Final: %ld | Δ: %ld | Current: %ld\n\r",
-               (long)startCount, (long)finalCount, (long)diff, (long)current);
-        HAL_Delay(500);
-    }
+	while (1) {
+		int32_t current = readEncoder(-1);
+		SetEscSpeed(dbg_spd);
+		Turning_SetAngle(dbg_str);
+		StopCarEsc();
+	}
 }
+
+// NAVIGATION
 
 void goDistance(float meters, float speed)
 {
@@ -390,137 +399,6 @@ void goDistanceP(float meters, float kP, float maxSpeed)
     }
 }
 
-void debugSetup() {
-	float dbg_spd = 0.5f;
-	float dbg_str = 0.0f;
-
-	while (1) {
-		int32_t current = readEncoder(-1);
-		SetEscSpeed(dbg_spd);
-		Turning_SetAngle(dbg_str);
-		StopCarEsc();
-	}
-}
-
-void echoTest() {
-  while (1) {
-	  uint8_t rx_data;
-	  if (HAL_UART_Receive(&huart3, &rx_data, 1, 10) == HAL_OK) {
-		HAL_UART_Transmit(&huart3, &rx_data, 1, HAL_MAX_DELAY);
-	  }
-  }
-}
-
-void dualEchoTest(void) {
-  uint8_t rx_data;
-
-  while (1) {
-    // From USB Serial (USART3)
-    if (HAL_UART_Receive(&huart3, &rx_data, 1, 10) == HAL_OK) {
-      HAL_UART_Transmit(&huart3, &rx_data, 1, HAL_MAX_DELAY);
-      HAL_UART_Transmit(&huart2, &rx_data, 1, HAL_MAX_DELAY);
-    }
-
-    // From Bluetooth (USART2)
-    if (HAL_UART_Receive(&huart2, &rx_data, 1, 10) == HAL_OK) {
-      HAL_UART_Transmit(&huart3, &rx_data, 1, HAL_MAX_DELAY);
-      HAL_UART_Transmit(&huart2, &rx_data, 1, HAL_MAX_DELAY);
-    }
-  }
-}
-
-// --- Dual Serial Wrappers ---
-void serialPrint(const char *msg)
-{
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-}
-
-void serialPrintln(const char *msg)
-{
-    serialPrint(msg);
-    serialPrint("\r\n");
-}
-
-char serialRead(void)
-{
-    uint8_t ch;
-    if (HAL_UART_Receive(&huart3, &ch, 1, 0) == HAL_OK) return ch;
-    if (HAL_UART_Receive(&huart2, &ch, 1, 0) == HAL_OK) return ch;
-    return 0;
-}
-
-// --- Control code ---
-void decodeDirection(char input, int8_t *throttle, int8_t *steering)
-{
-    switch (input) {
-        case 'F': *throttle =  1; *steering =  0; break;  // Forward
-        case 'B': *throttle = -1; *steering =  0; break;  // Backward
-        case 'L': *throttle =  0; *steering = -1; break;  // Left
-        case 'R': *throttle =  0; *steering =  1; break;  // Right
-        case 'G': *throttle =  1; *steering = -1; break;  // Forward + Left
-        case 'H': *throttle =  1; *steering =  1; break;  // Forward + Right
-        case 'I': *throttle = -1; *steering = -1; break;  // Backward + Left
-        case 'J': *throttle = -1; *steering =  1; break;  // Backward + Right
-        case 'S': *throttle =  0; *steering =  0; break;  // Stop
-        default: break;
-    }
-}
-
-void decodeSpeedChar(char input, float *speed)
-{
-    if (input >= '0' && input <= '9') {
-        int digit = input - '0';
-        *speed = (digit + 1) / 10.0f;   // '0'–'9' -> 0.1–1.0
-    }
-}
-
-void controlLoop(void)
-{
-    int8_t throttle = 0;
-    int8_t steering = 0;
-    float speed = 1.0f;   // throttle multiplier
-    char msg[64];
-    char cmd;
-
-    while (1)
-    {
-        cmd = serialRead();
-        if (cmd) {
-            decodeDirection(cmd, &throttle, &steering);
-            decodeSpeedChar(cmd, &speed);
-
-            // Scale throttle to ±2.0, steering fixed to ±0.5
-            float appliedThrottle = throttle * speed * 2.0f;
-            float appliedSteering = steering * 0.5f;
-
-            SetEscSpeed(appliedThrottle);
-            Turning_SetAngle(appliedSteering);
-
-            int len = snprintf(msg, sizeof(msg),
-                               "Cmd:%c | Th:%.2f | St:%.2f | Spd:%.1f\r\n",
-                               cmd, appliedThrottle, appliedSteering, speed);
-            HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, HAL_MAX_DELAY);
-            HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
-
-        }
-    }
-}
-
-void helloWorldLoop(void)
-{
-    const char *msg = "Hello World\r\n";
-
-    while (1)
-    {
-        // Send to both UARTs
-        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-        HAL_Delay(1000);  // wait 1 second
-    }
-}
-
 float pidDistance(float error, float Kp, float Ki, float Kd, float outMin, float outMax)
 {
     static float integral = 0.0f;
@@ -558,7 +436,6 @@ float pidDistance(float error, float Kp, float Ki, float Kd, float outMin, float
     prevError = error;
     return output;
 }
-
 void goDistancePID_live(void)
 {
     // --- CONFIGURABLE PARAMETERS (editable live in debugger) ---
@@ -673,44 +550,76 @@ void goDistancePID_live(void)
     }
 }
 
-void loopPrintAllCAN(void)
+// SERIAL COMMS
+void decodeDirection(char input, int8_t *throttle, int8_t *steering)
 {
-    FDCAN_RxHeaderTypeDef RxHeader;
-    uint8_t RxData[8];
-    const uint32_t heartbeatIntervalMs = 1000;  // heartbeat every 1s
-    uint32_t lastHeartbeat = HAL_GetTick();
-
-    printf("\n\r[CAN Monitor] Listening for messages...\n\r");
-
-    while (1)
-    {
-        // 1) Check for incoming CAN message
-        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
-        {
-            printf("ID: 0x%03lX | Type: %s | DLC: %d | Data:",
-                   (long)RxHeader.Identifier,
-                   (RxHeader.IdType == FDCAN_STANDARD_ID ? "STD" : "EXT"),
-                   (int)(RxHeader.DataLength >> 16));
-
-            for (int i = 0; i < (RxHeader.DataLength >> 16); i++)
-                printf(" %02X", RxData[i]);
-
-            printf("\n\r");
-        }
-
-        // 2) Heartbeat check
-        uint32_t now = HAL_GetTick();
-        if (now - lastHeartbeat >= heartbeatIntervalMs)
-        {
-            printf("[CAN Monitor] Heartbeat... system alive (%lu ms)\n\r", (unsigned long)now);
-            lastHeartbeat = now;
-        }
-
-        HAL_Delay(1);  // avoid 100% CPU usage
+    switch (input) {
+        case 'F': *throttle =  1; *steering =  0; break;  // Forward
+        case 'B': *throttle = -1; *steering =  0; break;  // Backward
+        case 'L': *throttle =  0; *steering = -1; break;  // Left
+        case 'R': *throttle =  0; *steering =  1; break;  // Right
+        case 'G': *throttle =  1; *steering = -1; break;  // Forward + Left
+        case 'H': *throttle =  1; *steering =  1; break;  // Forward + Right
+        case 'I': *throttle = -1; *steering = -1; break;  // Backward + Left
+        case 'J': *throttle = -1; *steering =  1; break;  // Backward + Right
+        case 'S': *throttle =  0; *steering =  0; break;  // Stop
+        default: break;
     }
 }
 
+void decodeSpeedChar(char input, float *speed)
+{
+    if (input >= '0' && input <= '9') {
+        int digit = input - '0';
+        *speed = (digit + 1) / 10.0f;   // '0'–'9' -> 0.1–1.0
+    }
+}
 
+void controlLoop(void)
+{
+    int8_t throttle = 0;
+    int8_t steering = 0;
+    float speed = 1.0f;   // throttle multiplier
+    char msg[64];
+    char cmd;
+
+    while (1)
+    {
+        cmd = serialRead();
+        if (cmd) {
+            decodeDirection(cmd, &throttle, &steering);
+            decodeSpeedChar(cmd, &speed);
+
+            // Scale throttle to ±2.0, steering fixed to ±0.5
+            float appliedThrottle = throttle * speed * 2.0f;
+            float appliedSteering = steering * 0.5f;
+
+            SetEscSpeed(appliedThrottle);
+            Turning_SetAngle(appliedSteering);
+
+            int len = snprintf(msg, sizeof(msg),
+                               "Cmd:%c | Th:%.2f | St:%.2f | Spd:%.1f\r\n",
+                               cmd, appliedThrottle, appliedSteering, speed);
+            HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, HAL_MAX_DELAY);
+            HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
+
+        }
+    }
+}
+
+void echo() {
+	uart_mb_t *mb = g_mb;
+    const char *hello = "Mailbox echo ready\r\n";
+    HAL_UART_Transmit(mb->huart, (uint8_t*)hello, strlen(hello), HAL_MAX_DELAY);
+
+    uint8_t b;
+    for (;;) {
+        while (uart_mb_get(mb, &b)) {
+            HAL_UART_Transmit(mb->huart, &b, 1, HAL_MAX_DELAY);
+        }
+        HAL_Delay(2);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -780,16 +689,8 @@ Error_Handler();
   HAL_TIM_PWM_Start(&htim13, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
   Turning_SetAngle(0);
-//  goDistance(1, 0.5);
-//  loopPrintEncoder();
-//  goDistanceP(1, 0.001, 0.6);
-//  debugSetup();
-  echoTest();
-//  dualEchoTest();
-//  controlLoop();
-//  helloWorldLoop();
-//  goDistancePID_live();
-//  loopPrintAllCAN();
+  uart_mb_register(&huart3, &g_mb);  // choose which UART feeds the global mailbox
+  echo();
   /* USER CODE END 2 */
 
   /* Infinite loop */
