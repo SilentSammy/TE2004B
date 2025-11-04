@@ -47,6 +47,47 @@ static inline int uart_mb_get(uart_mb_t *mb, uint8_t *b) {
     return 1;
 }
 
+// Non-blocking: get one byte from the first non-empty mailbox in the registry.
+// Returns 1 if a byte was read, 0 if all mailboxes are empty.
+static inline int uart_mb_get_any(uint8_t *b) {
+    extern uart_mb_t g_mailboxes[UART_MB_MAX];
+    extern uint32_t  g_mb_count;
+
+    for (uint32_t i = 0; i < g_mb_count; ++i) {
+        uart_mb_t *mb = &g_mailboxes[i];
+        if (mb->head != mb->tail) {
+            *b = mb->rb[mb->tail];
+            mb->tail = (uint16_t)((mb->tail + 1U) % RX_RB_SZ);
+            return 1;
+        }
+    }
+    return 0;  // all empty
+}
+
+// Broadcast a buffer to ALL registered UARTs.
+// Returns the count of successful HAL transmit calls.
+static inline int uart_mb_send_all(const uint8_t *buf, uint16_t len, uint32_t timeout)
+{
+    extern uart_mb_t g_mailboxes[UART_MB_MAX];
+    extern uint32_t  g_mb_count;
+
+    int ok = 0;
+    for (uint32_t i = 0; i < g_mb_count; ++i) {
+        UART_HandleTypeDef *huart = g_mailboxes[i].huart;
+        if (huart && HAL_UART_Transmit(huart, (uint8_t*)buf, len, timeout) == HAL_OK) {
+            ok++;
+        }
+    }
+    return ok;
+}
+
+// Convenience: broadcast a C-string (length = strlen)
+// Returns the count of successful HAL transmit calls.
+static inline int uart_mb_send_all_cstr(const char *s, uint32_t timeout)
+{
+    return uart_mb_send_all((const uint8_t*)s, (uint16_t)strlen(s), timeout);
+}
+
 // Optional: approximate count of buffered bytes
 static inline uint16_t uart_mb_count(const uart_mb_t *mb) {
     int16_t diff = (int16_t)mb->head - (int16_t)mb->tail;

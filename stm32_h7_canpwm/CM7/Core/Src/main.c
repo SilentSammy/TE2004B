@@ -620,6 +620,16 @@ void echo() {
         HAL_Delay(2);
     }
 }
+void echo_all(void) {
+    uint8_t b;
+    for (;;) {
+        while (uart_mb_get_any(&b)) {
+            uart_mb_send_all(&b, 1, 1000);
+        }
+        HAL_Delay(2);
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -690,7 +700,8 @@ Error_Handler();
   HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
   Turning_SetAngle(0);
   uart_mb_register(&huart3, &g_mb);  // choose which UART feeds the global mailbox
-  echo();
+  uart_mb_register(&huart2, NULL);
+  echo_all();
   /* USER CODE END 2 */
 
   /* Infinite loop */
