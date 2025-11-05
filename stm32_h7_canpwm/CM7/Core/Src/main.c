@@ -25,6 +25,9 @@
 #include <stdbool.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>   // strtod
+#include <errno.h>    // errno, ERANGE
+#include <math.h>     // isfinite
 #define UART_MAILBOX_IMPL     // <-- defines the implementation once
 #include "uart_mailbox.h"
 /* USER CODE END Includes */
@@ -58,6 +61,11 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+float turn = 0.5f;
+int8_t throttle = 0;
+int8_t steering = 0;
+float speed = 1.0f;   // throttle multiplier
+
 FDCAN_FilterTypeDef sFilterConfig;
 FDCAN_TxHeaderTypeDef TxHeader;
 FDCAN_RxHeaderTypeDef RxHeader;
@@ -75,7 +83,8 @@ static void MX_TIM13_Init(void);
 static void MX_TIM14_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+void handleToggle(char **args, int argc);
+void handleSetTurn(char **args, int argc);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -96,12 +105,9 @@ typedef struct {
     int argc;
     bool valid;
 } ParsedCommand;
-void handleToggle(char **args, int argc)
-{
-    HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
-}
 const CommandEntry commandTable[] = {
     { "TOGGLE", handleToggle },
+    { "SETTURN", handleSetTurn },
 };
 #define NUM_COMMANDS (sizeof(commandTable) / sizeof(commandTable[0]))
 
@@ -266,6 +272,10 @@ void Turning_SetAngle(float steer)
 
     /* 4) Write compare register */
     __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
+
+    char msg[64];
+    int len = snprintf(msg, sizeof(msg), "Stering set to:%.2f\r\n", steer);
+    uart_mb_send_all((uint8_t*)msg, len, HAL_MAX_DELAY);
 }
 void SetEscSpeed(float value)
 {
@@ -653,7 +663,6 @@ void decodeDirection(char input, int8_t *throttle, int8_t *steering)
         default: break;
     }
 }
-
 void decodeSpeedChar(char input, float *speed)
 {
     if (input >= '0' && input <= '9') {
@@ -685,9 +694,6 @@ void echo_all(void) {
 }
 static void processShortCmd(uint8_t cmd)
 {
-    static int8_t throttle = 0;
-    static int8_t steering = 0;
-    static float speed = 1.0f;   // throttle multiplier
     char msg[64];
 
     decodeDirection(cmd, &throttle, &steering);
@@ -695,7 +701,7 @@ static void processShortCmd(uint8_t cmd)
 
     // Scale throttle to ±2.0, steering fixed to ±0.5
     float appliedThrottle = throttle * speed * 2.0f;
-    float appliedSteering = steering * 0.5f;
+    float appliedSteering = steering * turn;
 
     SetEscSpeed(appliedThrottle);
     Turning_SetAngle(appliedSteering);
@@ -765,8 +771,50 @@ void commandLoop(void)
         HAL_Delay(2);
     }
 }
-static inline void send_line_all(const char *s) {
-    uart_mb_send_all((const uint8_t*)s, (uint16_t)strlen(s), HAL_MAX_DELAY);
+
+// COMMAND HANDLERS
+void handleToggle(char **args, int argc)
+{
+    HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
+}
+static inline char *rtrim(char *s) {
+    size_t n = strlen(s);
+    while (n && (unsigned char)s[n-1] <= ' ') s[--n] = '\0';  // trims space, \r, \n, \t
+    return s;
+}
+void handleSetTurn(char **args, int argc)
+{
+    if (argc < 1) {
+        uart_mb_send_all_cstr("ERR:Missing argument\r\n", 1000);
+        return;
+    }
+
+    char tmp[32];
+    size_t L = strlen(args[0]);
+    if (L >= sizeof(tmp)) L = sizeof(tmp) - 1;
+    memcpy(tmp, args[0], L);
+    tmp[L] = '\0';
+
+    rtrim(tmp);
+    for (char *p = tmp; *p; ++p) if (*p == ',') *p = '.';  // allow "0,2"
+
+    errno = 0;
+    char *end = NULL;
+    double dv = strtod(tmp, &end);  // <— portable
+    while (end && *end && (unsigned char)*end <= ' ') end++;  // ignore trailing spaces
+
+    if (end == tmp || (end && *end != '\0') || !isfinite(dv) || errno == ERANGE) {
+        uart_mb_send_all_cstr("ERR:Invalid float\r\n", 1000);
+        return;
+    }
+
+    turn = (float)dv;
+    float appliedSteering = steering * turn;
+    Turning_SetAngle(appliedSteering);
+
+    char msg[48];
+    snprintf(msg, sizeof(msg), "OK:TURN=%.3f\r\n", (double)turn);
+    uart_mb_send_all_cstr(msg, 1000);
 }
 
 /* USER CODE END 0 */
