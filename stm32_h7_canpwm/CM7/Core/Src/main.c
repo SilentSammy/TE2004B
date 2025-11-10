@@ -30,6 +30,7 @@
 #include <math.h>     // isfinite
 #define UART_MAILBOX_IMPL     // <-- defines the implementation once
 #include "uart_mailbox.h"
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -112,40 +113,40 @@ const CommandEntry commandTable[] = {
 #define NUM_COMMANDS (sizeof(commandTable) / sizeof(commandTable[0]))
 
 // CAN FUNCTIONS
+static inline uint8_t dlc_to_bytes(uint32_t dlc) {
+    static const uint8_t map[16] = {0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64};
+    return (dlc < 16) ? map[dlc] : 0;
+}
 void loopPrintAllCAN(void)
 {
     FDCAN_RxHeaderTypeDef RxHeader;
-    uint8_t RxData[8];
-    const uint32_t heartbeatIntervalMs = 1000;  // heartbeat every 1s
+    uint8_t RxData[64];  // safe for FD
+    const uint32_t heartbeatIntervalMs = 1000;
     uint32_t lastHeartbeat = HAL_GetTick();
 
     printf("\n\r[CAN Monitor] Listening for messages...\n\r");
 
-    while (1)
-    {
-        // 1) Check for incoming CAN message
-        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
-        {
-            printf("ID: 0x%03lX | Type: %s | DLC: %d | Data:",
-                   (long)RxHeader.Identifier,
+    while (1) {
+        if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK) {
+            uint32_t raw = RxHeader.DataLength;
+            uint8_t len  = (raw <= 64) ? (uint8_t)raw          // HAL variant where DataLength == bytes
+                                       : dlc_to_bytes(raw >> 16); // HAL variant with DLC<<16
+
+            printf("ID: 0x%03lX | Type: %s | Len: %u | Data:",
+                   (unsigned long)RxHeader.Identifier,
                    (RxHeader.IdType == FDCAN_STANDARD_ID ? "STD" : "EXT"),
-                   (int)(RxHeader.DataLength >> 16));
+                   (unsigned)len);
 
-            for (int i = 0; i < (RxHeader.DataLength >> 16); i++)
-                printf(" %02X", RxData[i]);
-
+            for (uint8_t i = 0; i < len; i++) printf(" %02X", RxData[i]);
             printf("\n\r");
         }
 
-        // 2) Heartbeat check
         uint32_t now = HAL_GetTick();
-        if (now - lastHeartbeat >= heartbeatIntervalMs)
-        {
+        if ((uint32_t)(now - lastHeartbeat) >= heartbeatIntervalMs) {
             printf("[CAN Monitor] Heartbeat... system alive (%lu ms)\n\r", (unsigned long)now);
             lastHeartbeat = now;
         }
-
-        HAL_Delay(1);  // avoid 100% CPU usage
+        HAL_Delay(1);
     }
 }
 int32_t readEncoder(int32_t timeoutMs /* = -1 */)
@@ -324,7 +325,6 @@ void debugSetup() {
 }
 
 // NAVIGATION
-
 void goDistance(float meters, float speed)
 {
     const float COUNTS_PER_METER = 16066.0f;
@@ -889,7 +889,9 @@ Error_Handler();
   uart_mb_register(&huart3, &g_mb);  // choose which UART feeds the global mailbox
   uart_mb_register(&huart2, NULL);
 //  echo_all();
-  commandLoop();
+//  commandLoop();
+  loopPrintAllCAN();
+//  loopPrintEncoder();
   /* USER CODE END 2 */
 
   /* Infinite loop */
