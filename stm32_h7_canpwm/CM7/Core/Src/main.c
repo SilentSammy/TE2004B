@@ -28,9 +28,9 @@
 #include <stdlib.h>   // strtod
 #include <errno.h>    // errno, ERANGE
 #include <math.h>     // isfinite
+#include <stdint.h>
 #define UART_MAILBOX_IMPL     // <-- defines the implementation once
 #include "uart_mailbox.h"
-#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -890,8 +890,8 @@ Error_Handler();
   uart_mb_register(&huart2, NULL);
 //  echo_all();
 //  commandLoop();
-  loopPrintAllCAN();
-//  loopPrintEncoder();
+//  loopPrintAllCAN();
+  loopPrintEncoder();
   /* USER CODE END 2 */
 
   /* Infinite loop */

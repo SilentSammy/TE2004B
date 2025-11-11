@@ -34,14 +34,15 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef struct {
-    uint16_t id;          // 11-bit CAN ID (0–2047) or CAN_ID_EMPTY
-    uint8_t  len;         // number of valid bytes (0–8)
-    uint8_t  data[8];     // latest received payload
+    uint16_t id;          // 0..2047, or CAN_ID_EMPTY
+    uint8_t  len;         // bytes stored (0..8)
+    uint8_t  data[8];     // latest payload
 } CAN_Entry_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define ENCODER_ID  0x123      // adjust if your encoder uses a different ID
 #define MAX_CAN_IDS   8
 #define CAN_ID_EMPTY  2048   // Sentinel value; 11-bit max is 0–2047
 /* DUAL_CORE_BOOT_SYNC_SEQUENCE: Define for dual core boot synchronization    */
@@ -64,6 +65,7 @@ typedef struct {
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+
 FDCAN_HandleTypeDef hfdcan1;
 
 TIM_HandleTypeDef htim13;
@@ -73,20 +75,14 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-float turn = 0.5f;
-int8_t throttle = 0;
-int8_t steering = 0;
-float speed = 1.0f;   // throttle multiplier
-
-// CAN SETUP
-static CAN_Entry_t latestCANVals[MAX_CAN_IDS] = { { .id = CAN_ID_EMPTY, .len = 0, .data = {0} }, };
+static CAN_Entry_t latestCANVals[MAX_CAN_IDS] = {
+    { .id = CAN_ID_EMPTY, .len = 0, .data = {0} },
+};
 FDCAN_FilterTypeDef sFilterConfig;
 FDCAN_TxHeaderTypeDef TxHeader;
 FDCAN_RxHeaderTypeDef RxHeader;
 uint8_t TxData[8] = {0x10, 0x34, 0x54, 0x76, 0x98, 0x00, 0x11, 0x22};
 uint8_t RxData[8];
-
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -103,9 +99,12 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// CAN FUNCTIONS
-static inline uint8_t dlc_to_bytes(uint32_t dlc) {
-    static const uint8_t map[16] = {0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64};
+// --- helpers ---
+
+static inline uint8_t dlc_to_bytes(uint32_t dlc)
+{
+    static const uint8_t map[16] =
+        {0,1,2,3,4,5,6,7,8, 12,16,20,24,32,48,64};
     return (dlc < 16) ? map[dlc] : 0;
 }
 static inline uint8_t header_payload_len_bytes(const FDCAN_RxHeaderTypeDef *h)
@@ -156,6 +155,10 @@ void consumeCAN(void)
             }
         }
 
+        // 3) If idx still < 0, the table is full — but per your guarantee (<=8 IDs),
+        // this should never happen. You can add a debug hook if you like:
+        // if (idx < 0) { /* DEBUG: unexpected extra ID; ignore or assert */ }
+
     } while (st == HAL_OK);
 }
 void loopPrintAllCAN(void)
@@ -190,107 +193,6 @@ void loopPrintAllCAN(void)
         HAL_Delay(1);
     }
 }
-int32_t readEncoder1(int32_t timeoutMs /* = -1 */)
-{
-    static int32_t lastPosition = 0;
-    FDCAN_RxHeaderTypeDef RxHeader;
-    uint8_t RxData[8];
-    HAL_StatusTypeDef status;
-
-    if (timeoutMs == -1)
-        timeoutMs = 200;  // Default wait time
-
-    // printf("\n\r[readEncoder] Draining FIFO...\n\r");
-
-    int framesRead = 0;
-    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
-
-    // 1) Drain FIFO0 completely, keep the latest valid frame
-    do {
-        status = HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData);
-        if (status == HAL_OK &&
-            RxHeader.IdType == FDCAN_STANDARD_ID &&
-            RxHeader.Identifier == 0x123)
-        {
-            int32_t val;
-            memcpy(&val, RxData, sizeof(val));
-            lastPosition = val;
-            framesRead++;
-        }
-    } while (status == HAL_OK);
-
-    // printf("[readEncoder] Frames drained: %d | FIFO capacity: %d | Latest value: %ld\n\r",
-    //        framesRead, fifoCapacity, (long)lastPosition);
-
-    // 2) If FIFO was full, decide whether to wait for a fresh frame
-    if (framesRead >= fifoCapacity && timeoutMs > 0) {
-        // printf("[readEncoder] FIFO likely full -> waiting up to %ld ms for a fresh frame...\n\r",
-        //        (long)timeoutMs);
-
-        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
-        uint32_t waited = 0;
-        while (HAL_GetTick() < timeout) {
-            if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK &&
-                RxHeader.IdType == FDCAN_STANDARD_ID &&
-                RxHeader.Identifier == 0x123)
-            {
-                int32_t val;
-                memcpy(&val, RxData, sizeof(val));
-                lastPosition = val;
-                // printf("[readEncoder] New frame received after %lu ms | Latest value: %ld\n\r",
-                //        (unsigned long)waited, (long)lastPosition);
-                break;
-            }
-            HAL_Delay(1);
-            waited++;
-        }
-
-        // if (HAL_GetTick() >= timeout)
-        //     printf("[readEncoder] Timeout (%ld ms) reached, returning last known value: %ld\n\r",
-        //            (long)timeoutMs, (long)lastPosition);
-    }
-    // else if (timeoutMs == 0) {
-    //     printf("[readEncoder] Non-blocking mode, returning immediately (may be stale): %ld\n\r",
-    //            (long)lastPosition);
-    // }
-    // else {
-    //     printf("[readEncoder] FIFO not full, returning immediately: %ld\n\r",
-    //            (long)lastPosition);
-    // }
-
-    return lastPosition;
-}
-void loopPrintEncoder(void)
-{
-    const uint32_t printIntervalMs = 100;   // print every 100 ms
-    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
-    uint32_t lastPrint = HAL_GetTick();
-    uint32_t lastHeartbeat = HAL_GetTick();
-
-    printf("\n\r[Encoder Monitor] Starting...\n\r");
-
-    while (1)
-    {
-        uint32_t now = HAL_GetTick();
-
-        // 1) Periodically read encoder value
-        if (now - lastPrint >= printIntervalMs)
-        {
-            int32_t encoderCount = readEncoder(-1);
-            printf("Encoder: %ld\n\r", (long)encoderCount);
-            lastPrint = now;
-        }
-
-        // 2) Heartbeat every second
-        if (now - lastHeartbeat >= heartbeatIntervalMs)
-        {
-            printf("[Encoder Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
-            lastHeartbeat = now;
-        }
-
-        HAL_Delay(1);
-    }
-}
 static inline int32_t le32_to_s32(const uint8_t *p)
 {
     uint32_t u = (uint32_t)p[0]
@@ -299,8 +201,6 @@ static inline int32_t le32_to_s32(const uint8_t *p)
                | ((uint32_t)p[3] << 24);
     return (int32_t)u;
 }
-
-// SENSORS
 int32_t readEncoder(int32_t timeoutMs /* = -1 */)
 {
     (void)timeoutMs;  // Not used in the polling-only model
@@ -324,79 +224,41 @@ int32_t readEncoder(int32_t timeoutMs /* = -1 */)
 
     // If we haven't seen ENCODER_ID yet, return the previous value (defaults to 0)
     return last;
-}
-
-// ACTUATORS
-void Turning_SetAngle(float steer)
+}/* USER CODE END 0 */
+void loopPrintEncoder(void)
 {
-    /* 0) Preprocess normalized input (-1..1) → (-90..90 degrees) */
-    float angle = steer * 90.0f;
+    const uint32_t printIntervalMs     = 100;   // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000;  // heartbeat every 1 s
+    uint32_t lastPrint     = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
 
-	/* 1) Clamp input */
-    if (angle < -90.0f) angle = -90.0f;
-    if (angle >  90.0f) angle =  90.0f;
+    printf("\n\r[Encoder Monitor] Starting (latest-value architecture)...\n\r");
 
-    /* 2) Map to pulse width in microseconds */
-    float pulseWidth = 1000.0f + (angle * 1000.0f) / 180.0f;   // 1000..2000 us
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
 
-    /* 3) Convert to compare value and clamp to ARR */
-    uint32_t arr   = __HAL_TIM_GET_AUTORELOAD(&htim13);        // e.g., 19999 for 20 ms frame
-    int32_t  value = (int32_t)lroundf(pulseWidth);             // round to nearest tick
+        // 1) Drain CAN FIFO and update registry
+        consumeCAN();   // this keeps latestCANVals[] up to date
 
-    if (value < 0) value = 0;
-    if ((uint32_t)value > arr) value = (int32_t)arr;
+        // 2) Periodically print encoder value
+        if ((uint32_t)(now - lastPrint) >= printIntervalMs)
+        {
+            int32_t enc = readEncoder(-1);
+            printf("Encoder: %ld\n\r", (long)enc);
+            lastPrint = now;
+        }
 
-    /* 4) Write compare register */
-    __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
+        // 3) Heartbeat every second
+        if ((uint32_t)(now - lastHeartbeat) >= heartbeatIntervalMs)
+        {
+            printf("[Encoder Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);  // small sleep to avoid 100% CPU
+    }
 }
-void SetEscSpeed(float value)
-{
-    /* 1) Clamp input range */
-    if (value < -1.0f) value = -1.0f;
-    if (value >  2.0f) value =  2.0f;
-
-    /* 2) Adjust asymmetry:
-          Forward (positive) -> halve output
-          Reverse (negative) -> unchanged */
-    if (value > 0.0f)
-        value *= 0.5f;
-
-    /* 3) Map to pulse width (µs)
-          -1 → 1000 µs
-           0 → 1500 µs
-          +1 → 2000 µs
-    */
-    float pulseWidth = 1500.0f + (value * 500.0f);
-
-    /* 4) Convert µs to timer ticks (1 tick = 1 µs assumed) */
-    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim14);
-    int32_t ticks = (int32_t)lroundf(pulseWidth);
-
-    /* 5) Clamp within timer range */
-    if (ticks < 0) ticks = 0;
-    if ((uint32_t)ticks > arr) ticks = (int32_t)arr;
-
-    /* 6) Apply PWM */
-    __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, (uint32_t)ticks);
-}
-void StopCarEsc(void)
-{
-    SetEscSpeed(0.0f);   // Neutral = 1500 µs pulse
-}
-void debugSetup() {
-	float dbg_spd = 0.5f;
-	float dbg_str = 0.0f;
-
-	while (1) {
-		int32_t current = readEncoder(-1);
-		SetEscSpeed(dbg_spd);
-		Turning_SetAngle(dbg_str);
-		StopCarEsc();
-	}
-}
-
-/* USER CODE END 0 */
-
 /**
   * @brief  The application entry point.
   * @retval int
@@ -467,10 +329,10 @@ Error_Handler();
   MX_TIM14_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start(&htim13, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
-  Turning_SetAngle(0);
-
+//  HAL_TIM_PWM_Start(&htim13, TIM_CHANNEL_1);
+//  HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
+//  loopPrintAllCAN();
+  loopPrintEncoder();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -591,7 +453,40 @@ static void MX_FDCAN1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN FDCAN1_Init 2 */
+    sFilterConfig.IdType = FDCAN_STANDARD_ID;
+    sFilterConfig.FilterIndex = 0;
+    sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+    sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    sFilterConfig.FilterID1 = 0x000;   // base ID (don't care)
+    sFilterConfig.FilterID2 = 0x000;   // mask = 0 → accept all messages
 
+    /* Configure global filter to reject all non-matching frames */
+    HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
+                                 FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
+
+    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
+      {
+         /* Filter configuration Error */
+         Error_Handler();
+      }
+     /* Start the FDCAN module */
+    if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
+      }
+         /* Start Error */
+    if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {
+      }
+         /* Notification Error */
+
+     /* Configure Tx buffer message */
+    TxHeader.Identifier = 0x111;
+    TxHeader.IdType = FDCAN_STANDARD_ID;
+    TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+    TxHeader.DataLength = FDCAN_DLC_BYTES_12;
+    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    TxHeader.BitRateSwitch = FDCAN_BRS_ON;
+    TxHeader.FDFormat = FDCAN_FD_CAN;
+    TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    TxHeader.MessageMarker = 0x00;
   /* USER CODE END FDCAN1_Init 2 */
 
 }
