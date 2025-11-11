@@ -273,10 +273,6 @@ void Turning_SetAngle(float steer)
 
     /* 4) Write compare register */
     __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
-
-    char msg[64];
-    int len = snprintf(msg, sizeof(msg), "Stering set to:%.2f\r\n", steer);
-    uart_mb_send_all((uint8_t*)msg, len, HAL_MAX_DELAY);
 }
 void SetEscSpeed(float value)
 {

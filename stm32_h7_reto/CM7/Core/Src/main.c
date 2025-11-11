@@ -33,18 +33,26 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
 typedef struct {
-    uint16_t id;          // 0..2047, or CAN_ID_EMPTY
-    uint8_t  len;         // bytes stored (0..8)
-    uint8_t  data[8];     // latest payload
-} CAN_Entry_t;
+    uint32_t id;           // CAN identifier (11-bit standard or 29-bit extended)
+    uint8_t  data[64];     // Payload (supports CAN-FD up to 64 bytes)
+    uint8_t  length;       // Actual data length in bytes
+    uint32_t timestamp;    // When message was received (HAL_GetTick())
+    bool     isExtended;   // true = 29-bit extended ID, false = 11-bit extended
+} CANMessage;
+
+typedef struct {
+    float roll;    // Roll angle in degrees (0.00° to 360.00°)
+    float pitch;   // Pitch angle in degrees (0.00° to 360.00°)
+    float yaw;     // Yaw angle in degrees (0.00° to 360.00°)
+} Orientation;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ENCODER_ID  0x123      // adjust if your encoder uses a different ID
-#define MAX_CAN_IDS   8
-#define CAN_ID_EMPTY  2048   // Sentinel value; 11-bit max is 0–2047
+
 /* DUAL_CORE_BOOT_SYNC_SEQUENCE: Define for dual core boot synchronization    */
 /*                             demonstration code based on hardware semaphore */
 /* This define is present in both CM7/CM4 projects                            */
@@ -75,14 +83,18 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-static CAN_Entry_t latestCANVals[MAX_CAN_IDS] = {
-    { .id = CAN_ID_EMPTY, .len = 0, .data = {0} },
-};
 FDCAN_FilterTypeDef sFilterConfig;
 FDCAN_TxHeaderTypeDef TxHeader;
 FDCAN_RxHeaderTypeDef RxHeader;
 uint8_t TxData[8] = {0x10, 0x34, 0x54, 0x76, 0x98, 0x00, 0x11, 0x22};
 uint8_t RxData[8];
+
+// Storage for latest CAN messages by ID
+CANMessage latestMsgs[] = {
+    {.id = 0x123, .length = 0, .timestamp = 0, .isExtended = false},  // Encoder
+    {.id = 0x124, .length = 0, .timestamp = 0, .isExtended = false}   // Other sensor
+};
+#define NUM_CAN_IDS (sizeof(latestMsgs) / sizeof(latestMsgs[0]))
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,68 +111,66 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// --- helpers ---
-
-static inline uint8_t dlc_to_bytes(uint32_t dlc)
-{
-    static const uint8_t map[16] =
-        {0,1,2,3,4,5,6,7,8, 12,16,20,24,32,48,64};
+static inline uint8_t dlc_to_bytes(uint32_t dlc) {
+    static const uint8_t map[16] = {0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64};
     return (dlc < 16) ? map[dlc] : 0;
 }
-static inline uint8_t header_payload_len_bytes(const FDCAN_RxHeaderTypeDef *h)
-{
-    uint32_t raw = h->DataLength;
-    return (raw <= 64U) ? (uint8_t)raw : dlc_to_bytes(raw >> 16);
-}
-void consumeCAN(void)
-{
-    FDCAN_RxHeaderTypeDef rxh;
-    uint8_t rxData[8];              // classic CAN only (0..8 bytes)
-    HAL_StatusTypeDef st;
 
-    // Drain FIFO0 completely
+/**
+ * @brief Drain FIFO and update all tracked CAN messages in latestMsgs[]
+ * @return Number of messages read from FIFO (total, not unique IDs)
+ */
+int drainAndUpdateCANMessages(void)
+{
+    FDCAN_RxHeaderTypeDef RxHeader;
+    uint8_t RxData[64];
+    HAL_StatusTypeDef status;
+    int totalFramesRead = 0;
+
+    // Drain entire FIFO, update matching IDs
     do {
-        st = HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rxh, rxData);
-        if (st != HAL_OK) break;
+        status = HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData);
+        if (status == HAL_OK) {
+            totalFramesRead++;
 
-        if (rxh.IdType != FDCAN_STANDARD_ID) {
-            // We only track 11-bit IDs in this build
-            continue;
-        }
+            // Check if this ID is in our tracking list
+            for (uint8_t i = 0; i < NUM_CAN_IDS; i++) {
+                bool idMatches = (RxHeader.Identifier == latestMsgs[i].id);
+                bool typeMatches = ((RxHeader.IdType == FDCAN_STANDARD_ID) && !latestMsgs[i].isExtended) ||
+                                   ((RxHeader.IdType == FDCAN_EXTENDED_ID) && latestMsgs[i].isExtended);
 
-        uint16_t id = (uint16_t)rxh.Identifier; // 0..2047
-        uint8_t  n  = header_payload_len_bytes(&rxh);
-        if (n > 8U) n = 8U;                     // just in case
+                if (idMatches && typeMatches) {
+                    // Update this message slot
+                    uint32_t raw = RxHeader.DataLength;
+                    uint8_t len = (raw <= 64) ? (uint8_t)raw : dlc_to_bytes(raw >> 16);
 
-        // 1) Try to update an existing slot
-        int idx = -1;
-        for (int i = 0; i < MAX_CAN_IDS; ++i) {
-            if (latestCANVals[i].id == id) { idx = i; break; }
-        }
-
-        if (idx >= 0) {
-            if (n) memcpy(latestCANVals[idx].data, rxData, n);
-            latestCANVals[idx].len = n;
-            continue;
-        }
-
-        // 2) Not found: insert into the first empty slot
-        for (int i = 0; i < MAX_CAN_IDS; ++i) {
-            if (latestCANVals[i].id == CAN_ID_EMPTY) {
-                if (n) memcpy(latestCANVals[i].data, rxData, n);
-                latestCANVals[i].len = n;
-                latestCANVals[i].id  = id;
-                idx = i;
-                break;
+                    latestMsgs[i].length = len;
+                    latestMsgs[i].timestamp = HAL_GetTick();
+                    memcpy(latestMsgs[i].data, RxData, len);
+                    break;  // Found match, no need to check other slots
+                }
             }
         }
+    } while (status == HAL_OK);
 
-        // 3) If idx still < 0, the table is full — but per your guarantee (<=8 IDs),
-        // this should never happen. You can add a debug hook if you like:
-        // if (idx < 0) { /* DEBUG: unexpected extra ID; ignore or assert */ }
-
-    } while (st == HAL_OK);
+    return totalFramesRead;
 }
+
+/**
+ * @brief Get latest CAN message for a specific ID
+ * @param id CAN identifier to retrieve
+ * @return Pointer to CANMessage or NULL if not found
+ */
+CANMessage* getCANMessageByID(uint32_t id)
+{
+    for (uint8_t i = 0; i < NUM_CAN_IDS; i++) {
+        if (latestMsgs[i].id == id) {
+            return &latestMsgs[i];
+        }
+    }
+    return NULL;  // ID not tracked
+}
+
 void loopPrintAllCAN(void)
 {
     FDCAN_RxHeaderTypeDef RxHeader;
@@ -193,72 +203,252 @@ void loopPrintAllCAN(void)
         HAL_Delay(1);
     }
 }
-static inline int32_t le32_to_s32(const uint8_t *p)
-{
-    uint32_t u = (uint32_t)p[0]
-               | ((uint32_t)p[1] << 8)
-               | ((uint32_t)p[2] << 16)
-               | ((uint32_t)p[3] << 24);
-    return (int32_t)u;
-}
+
 int32_t readEncoder(int32_t timeoutMs /* = -1 */)
 {
-    (void)timeoutMs;  // Not used in the polling-only model
+    static int32_t lastPosition = 0;
 
-    static int32_t last = 0;
+    if (timeoutMs == -1)
+        timeoutMs = 200;  // Default wait time
 
-    // Linear scan (N<=8 → effectively O(1))
-    for (int i = 0; i < MAX_CAN_IDS; ++i) {
-        if (latestCANVals[i].id == ENCODER_ID) {
-            // Expect at least 4 bytes for a 32-bit count
-            if (latestCANVals[i].len >= 4) {
-                last = le32_to_s32(latestCANVals[i].data);
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+
+    // 1) Drain FIFO and update all tracked messages
+    int framesRead = drainAndUpdateCANMessages();
+
+    // 2) Get the encoder message
+    CANMessage* encoderMsg = getCANMessageByID(0x123);
+    if (encoderMsg != NULL && encoderMsg->length >= 4) {
+        memcpy(&lastPosition, encoderMsg->data, sizeof(lastPosition));
+    }
+
+    // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                // Fresh data arrived, update encoder value
+                encoderMsg = getCANMessageByID(0x123);
+                if (encoderMsg != NULL && encoderMsg->length >= 4) {
+                    memcpy(&lastPosition, encoderMsg->data, sizeof(lastPosition));
+                }
+                break;
             }
-            return last; // return latest (updated or previous)
-        }
-        if (latestCANVals[i].id == CAN_ID_EMPTY) {
-            // Table not fully populated yet and ID not found
-            break;
+            HAL_Delay(1);
         }
     }
 
-    // If we haven't seen ENCODER_ID yet, return the previous value (defaults to 0)
-    return last;
-}/* USER CODE END 0 */
+    return lastPosition;
+}
+
+/**
+ * @brief Read orientation data (roll, pitch, yaw) from CAN ID 0x124
+ * @param orientation Pointer to Orientation struct to fill with decoded values
+ * @param timeoutMs Timeout in milliseconds (-1 for default 200ms, 0 for non-blocking)
+ * @return true if valid data was retrieved, false otherwise
+ */
+bool readOrientation(Orientation* orientation, int32_t timeoutMs /* = -1 */)
+{
+    static Orientation lastOrientation = {0.0f, 0.0f, 0.0f};
+
+    if (orientation == NULL) {
+        return false;  // Invalid pointer
+    }
+
+    if (timeoutMs == -1)
+        timeoutMs = 200;  // Default wait time
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+
+    // 1) Drain FIFO and update all tracked messages
+    int framesRead = drainAndUpdateCANMessages();
+
+    // 2) Get the orientation message
+    CANMessage* orientMsg = getCANMessageByID(0x124);
+    if (orientMsg != NULL && orientMsg->length >= 6) {
+        // Decode roll (bytes 0-1), pitch (bytes 2-3), yaw (bytes 4-5)
+        uint16_t rollRaw   = (uint16_t)orientMsg->data[0] | ((uint16_t)orientMsg->data[1] << 8);
+        uint16_t pitchRaw  = (uint16_t)orientMsg->data[2] | ((uint16_t)orientMsg->data[3] << 8);
+        uint16_t yawRaw    = (uint16_t)orientMsg->data[4] | ((uint16_t)orientMsg->data[5] << 8);
+
+        // Convert to degrees (0.01° resolution)
+        lastOrientation.roll  = rollRaw / 100.0f;
+        lastOrientation.pitch = pitchRaw / 100.0f;
+        lastOrientation.yaw   = yawRaw / 100.0f;
+    }
+
+    // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                // Fresh data arrived, update orientation
+                orientMsg = getCANMessageByID(0x124);
+                if (orientMsg != NULL && orientMsg->length >= 6) {
+                    uint16_t rollRaw   = (uint16_t)orientMsg->data[0] | ((uint16_t)orientMsg->data[1] << 8);
+                    uint16_t pitchRaw  = (uint16_t)orientMsg->data[2] | ((uint16_t)orientMsg->data[3] << 8);
+                    uint16_t yawRaw    = (uint16_t)orientMsg->data[4] | ((uint16_t)orientMsg->data[5] << 8);
+
+                    lastOrientation.roll  = rollRaw / 100.0f;
+                    lastOrientation.pitch = pitchRaw / 100.0f;
+                    lastOrientation.yaw   = yawRaw / 100.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
+    // Copy to output
+    *orientation = lastOrientation;
+
+    // Return true if we have valid data (timestamp > 0 means we received at least one message)
+    return (orientMsg != NULL && orientMsg->timestamp > 0);
+}
+
 void loopPrintEncoder(void)
 {
-    const uint32_t printIntervalMs     = 100;   // print every 100 ms
-    const uint32_t heartbeatIntervalMs = 1000;  // heartbeat every 1 s
-    uint32_t lastPrint     = HAL_GetTick();
+    const uint32_t printIntervalMs = 100;   // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
+    uint32_t lastPrint = HAL_GetTick();
     uint32_t lastHeartbeat = HAL_GetTick();
 
-    printf("\n\r[Encoder Monitor] Starting (latest-value architecture)...\n\r");
+    printf("\n\r[Encoder Monitor] Starting...\n\r");
 
     while (1)
     {
         uint32_t now = HAL_GetTick();
 
-        // 1) Drain CAN FIFO and update registry
-        consumeCAN();   // this keeps latestCANVals[] up to date
-
-        // 2) Periodically print encoder value
-        if ((uint32_t)(now - lastPrint) >= printIntervalMs)
+        // 1) Periodically read encoder value
+        if (now - lastPrint >= printIntervalMs)
         {
-            int32_t enc = readEncoder(-1);
-            printf("Encoder: %ld\n\r", (long)enc);
+            int32_t encoderCount = readEncoder(-1);
+            printf("Encoder: %ld\n\r", (long)encoderCount);
             lastPrint = now;
         }
 
-        // 3) Heartbeat every second
-        if ((uint32_t)(now - lastHeartbeat) >= heartbeatIntervalMs)
+        // 2) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
         {
             printf("[Encoder Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
             lastHeartbeat = now;
         }
 
-        HAL_Delay(1);  // small sleep to avoid 100% CPU
+        HAL_Delay(1);
     }
 }
+
+void loopPrintOrientation(void) {
+    const uint32_t printIntervalMs = 100;      // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[Orientation Monitor] Starting...\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // 1) Periodically read orientation values
+        if (now - lastPrint >= printIntervalMs)
+        {
+            Orientation orient;
+            if (readOrientation(&orient, -1)) {
+                printf("Roll: %6.2f° | Pitch: %6.2f° | Yaw: %6.2f°\n\r", orient.roll, orient.pitch, orient.yaw);
+            } else {
+                printf("Orientation: [No data]\n\r");
+            }
+            lastPrint = now;
+        }
+
+        // 2) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Orientation Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
+void loopPrintBoth(void) {
+    const uint32_t printIntervalMs = 100;      // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[Combined Monitor] Starting...\n\r");
+    printf("──────────────────────────────────────────────────────────────────\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // 1) Periodically read and display both values
+        if (now - lastPrint >= printIntervalMs)
+        {
+            // Single FIFO drain updates both messages
+            drainAndUpdateCANMessages();
+
+            // Read encoder
+            int32_t encoderCount = readEncoder(0);  // Non-blocking (already drained)
+
+            // Read orientation
+            Orientation orient;
+            bool hasOrientation = readOrientation(&orient, 0);  // Non-blocking
+
+            // Display combined output on one line
+            printf("Enc: %8ld | ", (long)encoderCount);
+            
+            if (hasOrientation) {
+                printf("R:%6.2f° P:%6.2f° Y:%6.2f°\n\r", 
+                       orient.roll, orient.pitch, orient.yaw);
+            } else {
+                printf("Orientation: [No data]\n\r");
+            }
+
+            lastPrint = now;
+        }
+
+        // 2) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Combined Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
+void Turning_SetAngle(float steer)
+{
+    /* 0) Preprocess normalized input (-1..1) → (-90..90 degrees) */
+    float angle = steer * 90.0f;
+
+	/* 1) Clamp input */
+    if (angle < -90.0f) angle = -90.0f;
+    if (angle >  90.0f) angle =  90.0f;
+
+    /* 2) Map to pulse width in microseconds */
+    float pulseWidth = 1000.0f + (angle * 1000.0f) / 180.0f;   // 1000..2000 us
+
+    /* 3) Convert to compare value and clamp to ARR */
+    uint32_t arr   = __HAL_TIM_GET_AUTORELOAD(&htim13);        // e.g., 19999 for 20 ms frame
+    int32_t  value = (int32_t)lroundf(pulseWidth);             // round to nearest tick
+
+    if (value < 0) value = 0;
+    if ((uint32_t)value > arr) value = (int32_t)arr;
+
+    /* 4) Write compare register */
+    __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
+}
+/* USER CODE END 0 */
+
 /**
   * @brief  The application entry point.
   * @retval int
@@ -279,7 +469,7 @@ int main(void)
 #if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
   /* Wait until CPU2 boots and enters in stop mode or timeout*/
   timeout = 0xFFFF;
-  while((__HAL_RCC_GET_FLAG(RCC_FLAG_D2CKRDY) != RESET) && (timeout-- > 0));
+//  while((__HAL_RCC_GET_FLAG(RCC_FLAG_D2CKRDY) != RESET) && (timeout-- > 0));
   if ( timeout < 0 )
   {
   Error_Handler();
@@ -329,10 +519,13 @@ Error_Handler();
   MX_TIM14_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-//  HAL_TIM_PWM_Start(&htim13, TIM_CHANNEL_1);
-//  HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim13, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
+  Turning_SetAngle(0);
 //  loopPrintAllCAN();
-  loopPrintEncoder();
+  loopPrintBoth();
+//  loopPrintEncoder();
+//  loopPrintOrientation();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -453,40 +646,42 @@ static void MX_FDCAN1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN FDCAN1_Init 2 */
-    sFilterConfig.IdType = FDCAN_STANDARD_ID;
-    sFilterConfig.FilterIndex = 0;
-    sFilterConfig.FilterType = FDCAN_FILTER_MASK;
-    sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-    sFilterConfig.FilterID1 = 0x000;   // base ID (don't care)
-    sFilterConfig.FilterID2 = 0x000;   // mask = 0 → accept all messages
+  /*AAO+*/
+          sFilterConfig.IdType = FDCAN_STANDARD_ID;
+          sFilterConfig.FilterIndex = 0;
+          sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+          sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+          sFilterConfig.FilterID1 = 0x000;   // base ID (don't care)
+          sFilterConfig.FilterID2 = 0x000;   // mask = 0 → accept all messages
 
-    /* Configure global filter to reject all non-matching frames */
-    HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
-                                 FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
+          /* Configure global filter to reject all non-matching frames */
+          HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
+                                       FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE);
 
-    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
-      {
-         /* Filter configuration Error */
-         Error_Handler();
-      }
-     /* Start the FDCAN module */
-    if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
-      }
-         /* Start Error */
-    if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {
-      }
-         /* Notification Error */
+          if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
+            {
+               /* Filter configuration Error */
+               Error_Handler();
+            }
+           /* Start the FDCAN module */
+          if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
+            }
+               /* Start Error */
+          if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {
+            }
+               /* Notification Error */
 
-     /* Configure Tx buffer message */
-    TxHeader.Identifier = 0x111;
-    TxHeader.IdType = FDCAN_STANDARD_ID;
-    TxHeader.TxFrameType = FDCAN_DATA_FRAME;
-    TxHeader.DataLength = FDCAN_DLC_BYTES_12;
-    TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    TxHeader.BitRateSwitch = FDCAN_BRS_ON;
-    TxHeader.FDFormat = FDCAN_FD_CAN;
-    TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-    TxHeader.MessageMarker = 0x00;
+           /* Configure Tx buffer message */
+          TxHeader.Identifier = 0x111;
+          TxHeader.IdType = FDCAN_STANDARD_ID;
+          TxHeader.TxFrameType = FDCAN_DATA_FRAME;
+          TxHeader.DataLength = FDCAN_DLC_BYTES_12;
+          TxHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+          TxHeader.BitRateSwitch = FDCAN_BRS_ON;
+          TxHeader.FDFormat = FDCAN_FD_CAN;
+          TxHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+          TxHeader.MessageMarker = 0x00;
+         /*AAO-*/
   /* USER CODE END FDCAN1_Init 2 */
 
 }

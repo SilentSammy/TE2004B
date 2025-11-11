@@ -146,10 +146,11 @@ void sendOrientationCAN() {
   uint16_t yaw_enc = (uint16_t)(yaw_norm * 100);
   
   // Pack into CAN message (little-endian)
-  orientData[0] = (byte)(roll_enc);
-  orientData[1] = (byte)(roll_enc >> 8);
-  orientData[2] = (byte)(pitch_enc);
-  orientData[3] = (byte)(pitch_enc >> 8);
+  // NOTE: we send pitch in bytes 0-1 and roll in bytes 2-3 (swapped by request)
+  orientData[0] = (byte)(pitch_enc);
+  orientData[1] = (byte)(pitch_enc >> 8);
+  orientData[2] = (byte)(roll_enc);
+  orientData[3] = (byte)(roll_enc >> 8);
   orientData[4] = (byte)(yaw_enc);
   orientData[5] = (byte)(yaw_enc >> 8);
   orientData[6] = 0;
