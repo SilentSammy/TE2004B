@@ -48,6 +48,11 @@ typedef struct {
     float yaw;     // Yaw angle in degrees (0.00° to 360.00°)
 } Orientation;
 
+typedef struct {
+    float throttle;  // Throttle value (-1.0 to +1.0)
+    float steering;  // Steering value (-1.0 to +1.0)
+} MotorControl;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -92,7 +97,8 @@ uint8_t RxData[8];
 // Storage for latest CAN messages by ID
 CANMessage latestMsgs[] = {
     {.id = 0x123, .length = 0, .timestamp = 0, .isExtended = false},  // Encoder
-    {.id = 0x124, .length = 0, .timestamp = 0, .isExtended = false}   // Other sensor
+    {.id = 0x124, .length = 0, .timestamp = 0, .isExtended = false},  // Orientation
+    {.id = 0x125, .length = 0, .timestamp = 0, .isExtended = false}   // Remote Control
 };
 #define NUM_CAN_IDS (sizeof(latestMsgs) / sizeof(latestMsgs[0]))
 /* USER CODE END PV */
@@ -111,6 +117,65 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// MOTORS AND SERVOS
+void Turning_SetAngle(float steer)
+{
+    /* 0) Preprocess normalized input (-1..1) → (-90..90 degrees) */
+    float angle = steer * 90.0f;
+
+	/* 1) Clamp input */
+    if (angle < -90.0f) angle = -90.0f;
+    if (angle >  90.0f) angle =  90.0f;
+
+    /* 2) Map to pulse width in microseconds */
+    float pulseWidth = 1000.0f + (angle * 1000.0f) / 180.0f;   // 1000..2000 us
+
+    /* 3) Convert to compare value and clamp to ARR */
+    uint32_t arr   = __HAL_TIM_GET_AUTORELOAD(&htim13);        // e.g., 19999 for 20 ms frame
+    int32_t  value = (int32_t)lroundf(pulseWidth);             // round to nearest tick
+
+    if (value < 0) value = 0;
+    if ((uint32_t)value > arr) value = (int32_t)arr;
+
+    /* 4) Write compare register */
+    __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
+}
+void SetEscSpeed(float value)
+{
+    /* 1) Clamp input range */
+    if (value < -1.0f) value = -1.0f;
+    if (value >  2.0f) value =  2.0f;
+
+    /* 2) Adjust asymmetry:
+          Forward (positive) -> halve output
+          Reverse (negative) -> unchanged */
+    if (value > 0.0f)
+        value *= 0.5f;
+
+    /* 3) Map to pulse width (µs)
+          -1 → 1000 µs
+           0 → 1500 µs
+          +1 → 2000 µs
+    */
+    float pulseWidth = 1500.0f + (value * 500.0f);
+
+    /* 4) Convert µs to timer ticks (1 tick = 1 µs assumed) */
+    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim14);
+    int32_t ticks = (int32_t)lroundf(pulseWidth);
+
+    /* 5) Clamp within timer range */
+    if (ticks < 0) ticks = 0;
+    if ((uint32_t)ticks > arr) ticks = (int32_t)arr;
+
+    /* 6) Apply PWM */
+    __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, (uint32_t)ticks);
+}
+void StopCarEsc(void)
+{
+    SetEscSpeed(0.0f);   // Neutral = 1500 µs pulse
+}
+
+// CAN FUNCTIONS
 static inline uint8_t dlc_to_bytes(uint32_t dlc) {
     static const uint8_t map[16] = {0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64};
     return (dlc < 16) ? map[dlc] : 0;
@@ -242,12 +307,6 @@ int32_t readEncoder(int32_t timeoutMs /* = -1 */)
     return lastPosition;
 }
 
-/**
- * @brief Read orientation data (roll, pitch, yaw) from CAN ID 0x124
- * @param orientation Pointer to Orientation struct to fill with decoded values
- * @param timeoutMs Timeout in milliseconds (-1 for default 200ms, 0 for non-blocking)
- * @return true if valid data was retrieved, false otherwise
- */
 bool readOrientation(Orientation* orientation, int32_t timeoutMs /* = -1 */)
 {
     static Orientation lastOrientation = {0.0f, 0.0f, 0.0f};
@@ -306,6 +365,63 @@ bool readOrientation(Orientation* orientation, int32_t timeoutMs /* = -1 */)
 
     // Return true if we have valid data (timestamp > 0 means we received at least one message)
     return (orientMsg != NULL && orientMsg->timestamp > 0);
+}
+
+bool readMotorControl(MotorControl* control, int32_t timeoutMs /* = -1 */)
+{
+    static MotorControl lastControl = {0.0f, 0.0f};
+
+    if (control == NULL) {
+        return false;  // Invalid pointer
+    }
+
+    if (timeoutMs == -1)
+        timeoutMs = 200;  // Default wait time
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+
+    // 1) Drain FIFO and update all tracked messages
+    int framesRead = drainAndUpdateCANMessages();
+
+    // 2) Get the motor control message
+    CANMessage* controlMsg = getCANMessageByID(0x125);
+    if (controlMsg != NULL && controlMsg->length >= 4) {
+        // Decode throttle (bytes 0-1), steering (bytes 2-3)
+        int16_t throttleRaw = (int16_t)((uint16_t)controlMsg->data[0] | ((uint16_t)controlMsg->data[1] << 8));
+        int16_t steeringRaw = (int16_t)((uint16_t)controlMsg->data[2] | ((uint16_t)controlMsg->data[3] << 8));
+
+        // Convert to normalized float (-1.0 to +1.0)
+        lastControl.throttle = throttleRaw / 1000.0f;
+        lastControl.throttle *= 2;
+        lastControl.steering = steeringRaw / 1000.0f;
+    }
+
+    // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                // Fresh data arrived, update motor control
+                controlMsg = getCANMessageByID(0x125);
+                if (controlMsg != NULL && controlMsg->length >= 4) {
+                    int16_t throttleRaw = (int16_t)((uint16_t)controlMsg->data[0] | ((uint16_t)controlMsg->data[1] << 8));
+                    int16_t steeringRaw = (int16_t)((uint16_t)controlMsg->data[2] | ((uint16_t)controlMsg->data[3] << 8));
+
+                    lastControl.throttle = throttleRaw / 1000.0f;
+                    lastControl.steering = steeringRaw / 1000.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
+    // Copy to output
+    *control = lastControl;
+
+    // Return true if we have valid data (timestamp > 0 means we received at least one message)
+    return (controlMsg != NULL && controlMsg->timestamp > 0);
 }
 
 void loopPrintEncoder(void)
@@ -375,46 +491,97 @@ void loopPrintOrientation(void) {
     }
 }
 
-void loopPrintBoth(void) {
+void loopPrintMotorControl(void) {
     const uint32_t printIntervalMs = 100;      // print every 100 ms
     const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
     uint32_t lastPrint = HAL_GetTick();
     uint32_t lastHeartbeat = HAL_GetTick();
 
-    printf("\n\r[Combined Monitor] Starting...\n\r");
-    printf("──────────────────────────────────────────────────────────────────\n\r");
+    printf("\n\r[Motor Control Monitor] Starting...\n\r");
 
     while (1)
     {
         uint32_t now = HAL_GetTick();
 
-        // 1) Periodically read and display both values
+        // 1) Read motor control values and apply to hardware
+        MotorControl control;
+        if (readMotorControl(&control, 0)) {  // Non-blocking read
+            // Apply steering to servo
+            Turning_SetAngle(control.steering);
+            
+            // Apply throttle to ESC
+            SetEscSpeed(control.throttle);
+        }
+
+        // 2) Periodically print motor control values
         if (now - lastPrint >= printIntervalMs)
         {
-            // Single FIFO drain updates both messages
+            if (readMotorControl(&control, 0)) {
+                printf("Throttle: %+5.2f | Steering: %+5.2f\n\r", control.throttle, control.steering);
+            } else {
+                printf("Motor Control: [No data]\n\r");
+            }
+            lastPrint = now;
+        }
+
+        // 3) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Motor Control Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
+void loopPrintAll(void) {
+    const uint32_t printIntervalMs = 100;
+    const uint32_t heartbeatIntervalMs = 1000;
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[Combined Monitor] Starting...\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // 1) Apply motor control commands
+        MotorControl control;
+        if (readMotorControl(&control, 0)) {
+            Turning_SetAngle(control.steering);
+            SetEscSpeed(control.throttle);
+        }
+
+        // 2) Periodically print all values
+        if (now - lastPrint >= printIntervalMs)
+        {
             drainAndUpdateCANMessages();
 
-            // Read encoder
-            int32_t encoderCount = readEncoder(0);  // Non-blocking (already drained)
-
-            // Read orientation
+            int32_t encoderCount = readEncoder(0);
             Orientation orient;
-            bool hasOrientation = readOrientation(&orient, 0);  // Non-blocking
+            bool hasOrientation = readOrientation(&orient, 0);
+            bool hasControl = readMotorControl(&control, 0);
 
-            // Display combined output on one line
             printf("Enc: %8ld | ", (long)encoderCount);
             
             if (hasOrientation) {
-                printf("R:%6.2f° P:%6.2f° Y:%6.2f°\n\r", 
-                       orient.roll, orient.pitch, orient.yaw);
+                printf("R:%6.2f° P:%6.2f° Y:%6.2f° | ", orient.roll, orient.pitch, orient.yaw);
             } else {
-                printf("Orientation: [No data]\n\r");
+                printf("Orient: [No data] | ");
+            }
+
+            if (hasControl) {
+                printf("T:%+5.2f S:%+5.2f\n\r", control.throttle, control.steering);
+            } else {
+                printf("Ctrl: [No data]\n\r");
             }
 
             lastPrint = now;
         }
 
-        // 2) Heartbeat every second
+        // 3) Heartbeat every second
         if (now - lastHeartbeat >= heartbeatIntervalMs)
         {
             printf("[Combined Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
@@ -425,28 +592,6 @@ void loopPrintBoth(void) {
     }
 }
 
-void Turning_SetAngle(float steer)
-{
-    /* 0) Preprocess normalized input (-1..1) → (-90..90 degrees) */
-    float angle = steer * 90.0f;
-
-	/* 1) Clamp input */
-    if (angle < -90.0f) angle = -90.0f;
-    if (angle >  90.0f) angle =  90.0f;
-
-    /* 2) Map to pulse width in microseconds */
-    float pulseWidth = 1000.0f + (angle * 1000.0f) / 180.0f;   // 1000..2000 us
-
-    /* 3) Convert to compare value and clamp to ARR */
-    uint32_t arr   = __HAL_TIM_GET_AUTORELOAD(&htim13);        // e.g., 19999 for 20 ms frame
-    int32_t  value = (int32_t)lroundf(pulseWidth);             // round to nearest tick
-
-    if (value < 0) value = 0;
-    if ((uint32_t)value > arr) value = (int32_t)arr;
-
-    /* 4) Write compare register */
-    __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
-}
 /* USER CODE END 0 */
 
 /**
@@ -523,9 +668,10 @@ Error_Handler();
   HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
   Turning_SetAngle(0);
 //  loopPrintAllCAN();
-  loopPrintBoth();
+ loopPrintAll();
 //  loopPrintEncoder();
 //  loopPrintOrientation();
+  // loopPrintMotorControl();
   /* USER CODE END 2 */
 
   /* Infinite loop */

@@ -2,6 +2,9 @@
 #include <mcp_can.h>
 #include <Wire.h>
 
+// Debug configuration
+#define DEBUG_BLE false  // Set to true for verbose BLE control messages
+
 // Pin definitions
 #define CAN0_INT  2
 #define CAN0_CS   4
@@ -12,119 +15,70 @@
 #define ENC_B 1
 #define MPU_SDA 6
 #define MPU_SCL 7
+#define LED_PIN 3  // Debug LED (changed from 8 to avoid SPI conflict)
 
-// MPU-9250 definitions
-#define MPU_ADDR 0x68
-#define PWR_MGMT_1 0x6B
-#define GYRO_XOUT_H 0x43
+// BLE UUIDs
+#define SERVICE_UUID        "12345678-1234-5678-1234-56789abcdef0"
+#define CHARACTERISTIC_UUID_LED      "12345678-1234-5678-1234-56789abcdef1"
+#define CHARACTERISTIC_UUID_THROTTLE "12345678-1234-5678-1234-56789abcdef2"
+#define CHARACTERISTIC_UUID_STEERING "12345678-1234-5678-1234-56789abcdef3"
+#define DEVICE_NAME "BLE_Sensor_Hub"
 
-//  CAN configuration
+// CAN configuration
 MCP_CAN CAN0(CAN0_CS);                      // CAN object
 const unsigned long TX_INTERVAL_MAX = 250;  // Always send every 250 ms
 const unsigned long TX_INTERVAL_MIN = 1;    // Never send faster than 1 ms
 const unsigned long ORIENT_INTERVAL = 20;   // Orientation CAN at 50Hz (20ms)
+const unsigned long CONTROL_INTERVAL = 50;  // Control CAN at 20Hz (50ms)
 byte txData[8] = {0};                       // CAN message buffer (encoder)
 byte orientData[8] = {0};                   // CAN message buffer (orientation)
+byte controlData[8] = {0};                  // CAN message buffer (motor control)
 bool canInitialized = false;
 
-//  Encoder setup
+// Encoder variables (functions in encoder.ino)
 volatile long encoderPosition = 0;
 volatile int lastEncoded = 0;
-void IRAM_ATTR updateEncoder() {
-  int MSB = digitalRead(ENC_A);
-  int LSB = digitalRead(ENC_B);
-  int encoded = (MSB << 1) | LSB;
-  int sum = (lastEncoded << 2) | encoded;
+void updateEncoder();  // Forward declaration
 
-  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011)
-    encoderPosition++;
-  else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000)
-    encoderPosition--;
-
-  lastEncoded = encoded;
-}
-
-// MPU-9250 variables
+// IMU variables (functions in imu.ino)
 float gx_offset = 0, gy_offset = 0, gz_offset = 0;  // Gyro calibration offsets
-float roll = 0, pitch = 0, yaw = 0;                 // Orientation (degrees, internal -180 to +180)
+float roll = 0, pitch = 0, yaw = 0;                 // Orientation (degrees)
 unsigned long lastMpuTime = 0;
 unsigned long lastOrientTxTime = 0;
 
-// MPU Functions
-void initMPU() {
-  Wire.begin(MPU_SDA, MPU_SCL);
-  delay(100);
-  
-  // Wake up MPU-9250
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(PWR_MGMT_1);
-  Wire.write(0x00);
-  byte error = Wire.endTransmission();
-  
-  if (error != 0) {
-    Serial.print("MPU init failed! Error: ");
-    Serial.println(error);
+// BLE Control variables
+float currentThrottle = 0.0;  // -1.0 to 1.0
+float currentSteering = 0.0;  // -1.0 to 1.0
+unsigned long lastControlTxTime = 0;
+bool controlChanged = false;
+
+// BLE Callback functions
+void onLedControl(uint8_t value) {
+  if (value > 0) {
+    digitalWrite(LED_PIN, HIGH);
+    if (DEBUG_BLE) Serial.println("LED: ON");
   } else {
-    Serial.println("MPU-9250 Ready");
+    digitalWrite(LED_PIN, LOW);
+    if (DEBUG_BLE) Serial.println("LED: OFF");
   }
-  delay(100);
 }
 
-void calibrateGyro() {
-  Serial.println("Calibrating gyro... Keep still!");
-  float sum_gx = 0, sum_gy = 0, sum_gz = 0;
-  
-  for (int i = 0; i < 200; i++) {
-    Wire.beginTransmission(MPU_ADDR);
-    Wire.write(GYRO_XOUT_H);
-    Wire.endTransmission(false);
-    Wire.requestFrom(MPU_ADDR, 6);
-    
-    if (Wire.available() == 6) {
-      int16_t gx = (Wire.read() << 8) | Wire.read();
-      int16_t gy = (Wire.read() << 8) | Wire.read();
-      int16_t gz = (Wire.read() << 8) | Wire.read();
-      
-      sum_gx += gx;
-      sum_gy += gy;
-      sum_gz += gz;
-    }
-    delay(10);
+void onThrottleControl(uint8_t value) {
+  currentThrottle = toBipolar(value);
+  controlChanged = true;
+  if (DEBUG_BLE) {
+    Serial.print("Throttle: ");
+    Serial.println(currentThrottle, 3);
   }
-  
-  gx_offset = sum_gx / 200.0;
-  gy_offset = sum_gy / 200.0;
-  gz_offset = sum_gz / 200.0;
-  
-  Serial.println("Gyro calibration complete");
 }
 
-bool readGyro(float &gx, float &gy, float &gz) {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(GYRO_XOUT_H);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 6);
-  
-  if (Wire.available() == 6) {
-    int16_t raw_gx = (Wire.read() << 8) | Wire.read();
-    int16_t raw_gy = (Wire.read() << 8) | Wire.read();
-    int16_t raw_gz = (Wire.read() << 8) | Wire.read();
-    
-    // Apply calibration and convert to °/s
-    gx = (raw_gx - gx_offset) / 131.0;
-    gy = (raw_gy - gy_offset) / 131.0;
-    gz = (raw_gz - gz_offset) / 131.0;
-    
-    return true;
+void onSteeringControl(uint8_t value) {
+  currentSteering = toBipolar(value);
+  controlChanged = true;
+  if (DEBUG_BLE) {
+    Serial.print("Steering: ");
+    Serial.println(currentSteering, 3);
   }
-  return false;
-}
-
-void updateOrientation(float gx, float gy, float gz, float dt) {
-  // Integrate gyro (all in degrees)
-  roll += gx * dt;
-  pitch -= gy * dt;
-  yaw += gz * dt;
 }
 
 void sendOrientationCAN() {
@@ -160,6 +114,32 @@ void sendOrientationCAN() {
   CAN0.sendMsgBuf(0x124, 0, 8, orientData);
 }
 
+void sendControlCAN() {
+  // Convert float (-1.0 to +1.0) to int16_t (-1000 to +1000)
+  int16_t throttle_enc = (int16_t)(currentThrottle * 1000);
+  int16_t steering_enc = (int16_t)(currentSteering * 1000);
+  
+  // Pack into CAN message (little-endian)
+  controlData[0] = (byte)(throttle_enc);
+  controlData[1] = (byte)(throttle_enc >> 8);
+  controlData[2] = (byte)(steering_enc);
+  controlData[3] = (byte)(steering_enc >> 8);
+  controlData[4] = 0;
+  controlData[5] = 0;
+  controlData[6] = 0;
+  controlData[7] = 0;
+  
+  // Send on CAN ID 0x125
+  byte sndStat = CAN0.sendMsgBuf(0x125, 0, 8, controlData);
+  
+  if (DEBUG_BLE && sndStat == CAN_OK) {
+    Serial.print("CAN Control TX - T:");
+    Serial.print(currentThrottle, 2);
+    Serial.print(" S:");
+    Serial.println(currentSteering, 2);
+  }
+}
+
 // Helpers
 inline void fastStatusPrint(bool sent, long pos) {
   Serial.write(sent ? 'Y' : 'N');  // 1 char: Y or N
@@ -171,8 +151,12 @@ inline void fastStatusPrint(bool sent, long pos) {
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
-  Serial.println("\nESP32-C3 Sensor Hub (Encoder + IMU → CAN)");
-  Serial.println("==========================================");
+  Serial.println("\nESP32-C3 Sensor Hub (Encoder + IMU + BLE → CAN)");
+  Serial.println("================================================");
+
+  // LED setup
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   // Encoder setup
   pinMode(ENC_A, INPUT_PULLUP);
@@ -194,6 +178,14 @@ void setup() {
   // MPU-9250 setup
   initMPU();
   calibrateGyro();
+  
+  // BLE setup
+  Serial.println("Initializing BLE...");
+  BLE_init(DEVICE_NAME, SERVICE_UUID);
+  BLE_addCharacteristic(CHARACTERISTIC_UUID_LED, onLedControl);
+  BLE_addCharacteristic(CHARACTERISTIC_UUID_THROTTLE, onThrottleControl);
+  BLE_addCharacteristic(CHARACTERISTIC_UUID_STEERING, onSteeringControl);
+  BLE_start(DEVICE_NAME);
   
   Serial.println("System Ready!");
   Serial.println();
@@ -219,6 +211,15 @@ void loop() {
   if (now - lastOrientTxTime >= ORIENT_INTERVAL) {
     lastOrientTxTime = now;
     sendOrientationCAN();
+  }
+  
+  // ========== CONTROL CAN TX (Event + Periodic) ==========
+  bool controlDueByTimeout = (now - lastControlTxTime >= CONTROL_INTERVAL);
+  
+  if (controlChanged || controlDueByTimeout) {
+    lastControlTxTime = now;
+    controlChanged = false;
+    sendControlCAN();
   }
   
   // ========== ENCODER CAN TX (Variable rate) ==========
