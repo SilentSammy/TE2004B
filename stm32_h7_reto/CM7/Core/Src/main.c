@@ -53,6 +53,18 @@ typedef struct {
     float steering;  // Steering value (-1.0 to +1.0)
 } MotorControl;
 
+typedef struct {
+    float gx;  // Angular velocity around X-axis (°/s)
+    float gy;  // Angular velocity around Y-axis (°/s)
+    float gz;  // Angular velocity around Z-axis (°/s)
+} AngularVelocity;
+
+typedef struct {
+    float ax;  // Linear acceleration along X-axis (m/s²)
+    float ay;  // Linear acceleration along Y-axis (m/s²)
+    float az;  // Linear acceleration along Z-axis (m/s²)
+} LinearAcceleration;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -98,7 +110,9 @@ uint8_t RxData[8];
 CANMessage latestMsgs[] = {
     {.id = 0x123, .length = 0, .timestamp = 0, .isExtended = false},  // Encoder
     {.id = 0x124, .length = 0, .timestamp = 0, .isExtended = false},  // Orientation
-    {.id = 0x125, .length = 0, .timestamp = 0, .isExtended = false}   // Remote Control
+    {.id = 0x125, .length = 0, .timestamp = 0, .isExtended = false},  // Motor Control
+    {.id = 0x126, .length = 0, .timestamp = 0, .isExtended = false},  // Angular Velocity
+    {.id = 0x127, .length = 0, .timestamp = 0, .isExtended = false}   // Linear Acceleration
 };
 #define NUM_CAN_IDS (sizeof(latestMsgs) / sizeof(latestMsgs[0]))
 /* USER CODE END PV */
@@ -424,6 +438,106 @@ bool readMotorControl(MotorControl* control, int32_t timeoutMs /* = -1 */)
     return (controlMsg != NULL && controlMsg->timestamp > 0);
 }
 
+bool readAngularVelocity(AngularVelocity* angvel, int32_t timeoutMs /* = -1 */)
+{
+    static AngularVelocity lastAngvel = {0.0f, 0.0f, 0.0f};
+
+    if (angvel == NULL) {
+        return false;
+    }
+
+    if (timeoutMs == -1)
+        timeoutMs = 200;
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+    int framesRead = drainAndUpdateCANMessages();
+
+    CANMessage* angvelMsg = getCANMessageByID(0x126);
+    if (angvelMsg != NULL && angvelMsg->length >= 6) {
+        int16_t gx_raw = (int16_t)((uint16_t)angvelMsg->data[0] | ((uint16_t)angvelMsg->data[1] << 8));
+        int16_t gy_raw = (int16_t)((uint16_t)angvelMsg->data[2] | ((uint16_t)angvelMsg->data[3] << 8));
+        int16_t gz_raw = (int16_t)((uint16_t)angvelMsg->data[4] | ((uint16_t)angvelMsg->data[5] << 8));
+
+        lastAngvel.gx = gx_raw / 10.0f;
+        lastAngvel.gy = gy_raw / 10.0f;
+        lastAngvel.gz = gz_raw / 10.0f;
+    }
+
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                angvelMsg = getCANMessageByID(0x126);
+                if (angvelMsg != NULL && angvelMsg->length >= 6) {
+                    int16_t gx_raw = (int16_t)((uint16_t)angvelMsg->data[0] | ((uint16_t)angvelMsg->data[1] << 8));
+                    int16_t gy_raw = (int16_t)((uint16_t)angvelMsg->data[2] | ((uint16_t)angvelMsg->data[3] << 8));
+                    int16_t gz_raw = (int16_t)((uint16_t)angvelMsg->data[4] | ((uint16_t)angvelMsg->data[5] << 8));
+
+                    lastAngvel.gx = gx_raw / 10.0f;
+                    lastAngvel.gy = gy_raw / 10.0f;
+                    lastAngvel.gz = gz_raw / 10.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
+    *angvel = lastAngvel;
+    return (angvelMsg != NULL && angvelMsg->timestamp > 0);
+}
+
+bool readLinearAcceleration(LinearAcceleration* accel, int32_t timeoutMs /* = -1 */)
+{
+    static LinearAcceleration lastAccel = {0.0f, 0.0f, 0.0f};
+
+    if (accel == NULL) {
+        return false;
+    }
+
+    if (timeoutMs == -1)
+        timeoutMs = 200;
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+    int framesRead = drainAndUpdateCANMessages();
+
+    CANMessage* accelMsg = getCANMessageByID(0x127);
+    if (accelMsg != NULL && accelMsg->length >= 6) {
+        int16_t ax_raw = (int16_t)((uint16_t)accelMsg->data[0] | ((uint16_t)accelMsg->data[1] << 8));
+        int16_t ay_raw = (int16_t)((uint16_t)accelMsg->data[2] | ((uint16_t)accelMsg->data[3] << 8));
+        int16_t az_raw = (int16_t)((uint16_t)accelMsg->data[4] | ((uint16_t)accelMsg->data[5] << 8));
+
+        lastAccel.ax = ax_raw / 100.0f;
+        lastAccel.ay = ay_raw / 100.0f;
+        lastAccel.az = az_raw / 100.0f;
+    }
+
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                accelMsg = getCANMessageByID(0x127);
+                if (accelMsg != NULL && accelMsg->length >= 6) {
+                    int16_t ax_raw = (int16_t)((uint16_t)accelMsg->data[0] | ((uint16_t)accelMsg->data[1] << 8));
+                    int16_t ay_raw = (int16_t)((uint16_t)accelMsg->data[2] | ((uint16_t)accelMsg->data[3] << 8));
+                    int16_t az_raw = (int16_t)((uint16_t)accelMsg->data[4] | ((uint16_t)accelMsg->data[5] << 8));
+
+                    lastAccel.ax = ax_raw / 100.0f;
+                    lastAccel.ay = ay_raw / 100.0f;
+                    lastAccel.az = az_raw / 100.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
+    *accel = lastAccel;
+    return (accelMsg != NULL && accelMsg->timestamp > 0);
+}
+
 void loopPrintEncoder(void)
 {
     const uint32_t printIntervalMs = 100;   // print every 100 ms
@@ -561,21 +675,37 @@ void loopPrintAll(void) {
 
             int32_t encoderCount = readEncoder(0);
             Orientation orient;
+            AngularVelocity angvel;
+            LinearAcceleration accel;
             bool hasOrientation = readOrientation(&orient, 0);
+            bool hasAngvel = readAngularVelocity(&angvel, 0);
+            bool hasAccel = readLinearAcceleration(&accel, 0);
             bool hasControl = readMotorControl(&control, 0);
 
-            printf("Enc: %8ld | ", (long)encoderCount);
+            printf("Enc:%8ld | ", (long)encoderCount);
             
             if (hasOrientation) {
-                printf("R:%6.2f° P:%6.2f° Y:%6.2f° | ", orient.roll, orient.pitch, orient.yaw);
+                printf("R:%6.2f P:%6.2f Y:%6.2f | ", orient.roll, orient.pitch, orient.yaw);
             } else {
-                printf("Orient: [No data] | ");
+                printf("Orient:[No data] | ");
+            }
+
+            if (hasAngvel) {
+                printf("Gx:%+6.1f Gy:%+6.1f Gz:%+6.1f | ", angvel.gx, angvel.gy, angvel.gz);
+            } else {
+                printf("Angvel:[No data] | ");
+            }
+
+            if (hasAccel) {
+                printf("Ax:%+5.2f Ay:%+5.2f Az:%+5.2f | ", accel.ax, accel.ay, accel.az);
+            } else {
+                printf("Accel:[No data] | ");
             }
 
             if (hasControl) {
                 printf("T:%+5.2f S:%+5.2f\n\r", control.throttle, control.steering);
             } else {
-                printf("Ctrl: [No data]\n\r");
+                printf("Ctrl:[No data]\n\r");
             }
 
             lastPrint = now;

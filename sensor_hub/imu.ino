@@ -6,6 +6,7 @@
 // MPU-9250 Register Definitions
 #define MPU_ADDR 0x68
 #define PWR_MGMT_1 0x6B
+#define ACCEL_XOUT_H 0x3B
 #define GYRO_XOUT_H 0x43
 
 void initMPU() {
@@ -71,6 +72,27 @@ bool readGyro(float &gx, float &gy, float &gz) {
     gx = (raw_gx - gx_offset) / 131.0;
     gy = (raw_gy - gy_offset) / 131.0;
     gz = (raw_gz - gz_offset) / 131.0;
+    
+    return true;
+  }
+  return false;
+}
+
+bool readAccel(float &ax, float &ay, float &az) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(ACCEL_XOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6);
+  
+  if (Wire.available() == 6) {
+    int16_t raw_ax = (Wire.read() << 8) | Wire.read();
+    int16_t raw_ay = (Wire.read() << 8) | Wire.read();
+    int16_t raw_az = (Wire.read() << 8) | Wire.read();
+    
+    // Convert to m/s² (±2g range, 16384 LSB/g, 9.81 m/s²/g)
+    ax = (raw_ax / 16384.0) * 9.81;
+    ay = (raw_ay / 16384.0) * 9.81;
+    az = (raw_az / 16384.0) * 9.81;
     
     return true;
   }

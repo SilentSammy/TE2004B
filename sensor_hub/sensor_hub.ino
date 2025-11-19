@@ -30,9 +30,13 @@ const unsigned long TX_INTERVAL_MAX = 250;  // Always send every 250 ms
 const unsigned long TX_INTERVAL_MIN = 1;    // Never send faster than 1 ms
 const unsigned long ORIENT_INTERVAL = 20;   // Orientation CAN at 50Hz (20ms)
 const unsigned long CONTROL_INTERVAL = 50;  // Control CAN at 20Hz (50ms)
+const unsigned long ANGVEL_INTERVAL = 20;   // Angular velocity CAN at 50Hz (20ms)
+const unsigned long ACCEL_INTERVAL = 20;    // Acceleration CAN at 50Hz (20ms)
 byte txData[8] = {0};                       // CAN message buffer (encoder)
 byte orientData[8] = {0};                   // CAN message buffer (orientation)
 byte controlData[8] = {0};                  // CAN message buffer (motor control)
+byte angvelData[8] = {0};                   // CAN message buffer (angular velocity)
+byte accelData[8] = {0};                    // CAN message buffer (linear acceleration)
 bool canInitialized = false;
 
 // Encoder variables (functions in encoder.ino)
@@ -45,6 +49,8 @@ float gx_offset = 0, gy_offset = 0, gz_offset = 0;  // Gyro calibration offsets
 float roll = 0, pitch = 0, yaw = 0;                 // Orientation (degrees)
 unsigned long lastMpuTime = 0;
 unsigned long lastOrientTxTime = 0;
+unsigned long lastAngvelTxTime = 0;
+unsigned long lastAccelTxTime = 0;
 
 // BLE Control variables
 float currentThrottle = 0.0;  // -1.0 to 1.0
@@ -140,6 +146,46 @@ void sendControlCAN() {
   }
 }
 
+void sendAngularVelocityCAN(float gx, float gy, float gz) {
+  // Convert °/s to int16_t (±1000 = ±1000 °/s)
+  int16_t gx_enc = (int16_t)(gx * 10);
+  int16_t gy_enc = (int16_t)(gy * 10);
+  int16_t gz_enc = (int16_t)(gz * 10);
+  
+  // Pack into CAN message (little-endian)
+  angvelData[0] = (byte)(gx_enc);
+  angvelData[1] = (byte)(gx_enc >> 8);
+  angvelData[2] = (byte)(gy_enc);
+  angvelData[3] = (byte)(gy_enc >> 8);
+  angvelData[4] = (byte)(gz_enc);
+  angvelData[5] = (byte)(gz_enc >> 8);
+  angvelData[6] = 0;
+  angvelData[7] = 0;
+  
+  // Send on CAN ID 0x126
+  CAN0.sendMsgBuf(0x126, 0, 8, angvelData);
+}
+
+void sendLinearAccelCAN(float ax, float ay, float az) {
+  // Convert m/s² to int16_t (±100 = ±10.0 m/s²)
+  int16_t ax_enc = (int16_t)(ax * 100);
+  int16_t ay_enc = (int16_t)(ay * 100);
+  int16_t az_enc = (int16_t)(az * 100);
+  
+  // Pack into CAN message (little-endian)
+  accelData[0] = (byte)(ax_enc);
+  accelData[1] = (byte)(ax_enc >> 8);
+  accelData[2] = (byte)(ay_enc);
+  accelData[3] = (byte)(ay_enc >> 8);
+  accelData[4] = (byte)(az_enc);
+  accelData[5] = (byte)(az_enc >> 8);
+  accelData[6] = 0;
+  accelData[7] = 0;
+  
+  // Send on CAN ID 0x127
+  CAN0.sendMsgBuf(0x127, 0, 8, accelData);
+}
+
 // Helpers
 inline void fastStatusPrint(bool sent, long pos) {
   Serial.write(sent ? 'Y' : 'N');  // 1 char: Y or N
@@ -193,17 +239,36 @@ void setup() {
   lastMpuTime = millis();
 }
 
+void loop2() {
+  float gx, gy, gz, ax, ay, az;
+  
+  if (readGyro(gx, gy, gz) && readAccel(ax, ay, az)) {
+    Serial.print("Gyro: ");
+    Serial.print(gx, 2); Serial.print(" ");
+    Serial.print(gy, 2); Serial.print(" ");
+    Serial.print(gz, 2); Serial.print(" | Accel: ");
+    Serial.print(ax, 2); Serial.print(" ");
+    Serial.print(ay, 2); Serial.print(" ");
+    Serial.println(az, 2);
+  }
+  
+  delay(100);
+}
+
 void loop() {
   if (!canInitialized) return;
 
   unsigned long now = millis();
   
-  // ========== ORIENTATION UPDATE (Every loop, ~100Hz) ==========
+  // ========== IMU READS (Every loop, ~100Hz) ==========
   float dt = (now - lastMpuTime) / 1000.0;
   lastMpuTime = now;
   
-  float gx, gy, gz;
-  if (readGyro(gx, gy, gz)) {
+  float gx, gy, gz, ax, ay, az;
+  bool hasGyro = readGyro(gx, gy, gz);
+  bool hasAccel = readAccel(ax, ay, az);
+  
+  if (hasGyro) {
     updateOrientation(gx, gy, gz, dt);
   }
   
@@ -211,6 +276,18 @@ void loop() {
   if (now - lastOrientTxTime >= ORIENT_INTERVAL) {
     lastOrientTxTime = now;
     sendOrientationCAN();
+  }
+  
+  // ========== ANGULAR VELOCITY CAN TX (Fixed 50Hz) ==========
+  if (hasGyro && now - lastAngvelTxTime >= ANGVEL_INTERVAL) {
+    lastAngvelTxTime = now;
+    sendAngularVelocityCAN(gx, gy, gz);
+  }
+  
+  // ========== LINEAR ACCEL CAN TX (Fixed 50Hz) ==========
+  if (hasAccel && now - lastAccelTxTime >= ACCEL_INTERVAL) {
+    lastAccelTxTime = now;
+    sendLinearAccelCAN(ax, ay, az);
   }
   
   // ========== CONTROL CAN TX (Event + Periodic) ==========
