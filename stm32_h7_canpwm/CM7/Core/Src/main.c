@@ -886,8 +886,8 @@ Error_Handler();
   uart_mb_register(&huart2, NULL);
 //  echo_all();
 //  commandLoop();
-//  loopPrintAllCAN();
-  loopPrintEncoder();
+  loopPrintAllCAN();
+//  loopPrintEncoder();
   /* USER CODE END 2 */
 
   /* Infinite loop */

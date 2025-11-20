@@ -65,6 +65,11 @@ typedef struct {
     float az;  // Linear acceleration along Z-axis (m/s²)
 } LinearAcceleration;
 
+typedef struct {
+    int32_t waypoint;  // Encoder count at which to trigger the event
+    void (*callback)(void); // Function pointer to execute when waypoint is reached
+} EncoderEvent;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -187,6 +192,16 @@ void SetEscSpeed(float value)
 void StopCarEsc(void)
 {
     SetEscSpeed(0.0f);   // Neutral = 1500 µs pulse
+}
+void debugLoop() {
+	float dbg_spd = 0.5f;
+	float dbg_str = 0.0f;
+
+	while (1) {
+		SetEscSpeed(dbg_spd);
+		Turning_SetAngle(dbg_str);
+		StopCarEsc();
+	}
 }
 
 // CAN FUNCTIONS
@@ -605,6 +620,64 @@ void loopPrintOrientation(void) {
     }
 }
 
+void loopPrintUnwrapped(void) {
+    const uint32_t printIntervalMs = 100;
+    const uint32_t heartbeatIntervalMs = 1000;
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    float unwrappedYaw = 0.0f;
+    bool initialized = false;
+
+    printf("\n\r[Unwrapped Yaw Monitor] Starting...\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // Periodically read and unwrap yaw
+        if (now - lastPrint >= printIntervalMs)
+        {
+            drainAndUpdateCANMessages();
+
+            Orientation orient;
+            if (readOrientation(&orient, 0)) {
+                if (!initialized) {
+                    // First reading - initialize unwrapped value
+                    unwrappedYaw = orient.yaw;
+                    initialized = true;
+                } else {
+                    // Unwrap algorithm
+                    float wrappedPrev = fmodf(unwrappedYaw, 360.0f);
+                    if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
+                    
+                    float delta = orient.yaw - wrappedPrev;
+                    
+                    // Normalize delta to [-180, 180]
+                    while (delta > 180.0f) delta -= 360.0f;
+                    while (delta < -180.0f) delta += 360.0f;
+                    
+                    unwrappedYaw += delta;
+                }
+                
+                printf("Wrapped: %6.2f° | Unwrapped: %8.2f°\n\r", orient.yaw, unwrappedYaw);
+            } else {
+                printf("Orientation: [No data]\n\r");
+            }
+            lastPrint = now;
+        }
+
+        // Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Unwrapped Yaw Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
 void loopPrintMotorControl(void) {
     const uint32_t printIntervalMs = 100;      // print every 100 ms
     const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
@@ -722,6 +795,223 @@ void loopPrintAll(void) {
     }
 }
 
+// Waypoint callback functions
+void ledOn(void) {
+    HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_SET);
+    printf("LED ON at waypoint\n\r");
+}
+
+void ledOff(void) {
+    HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
+    printf("LED OFF at waypoint\n\r");
+}
+
+void setSteering(void) {
+    Turning_SetAngle(0.6f);
+    printf("Steering set to 0.6 at waypoint\n\r");
+}
+
+void unsetSteering(void) {
+    Turning_SetAngle(0.0f);
+    printf("Steering reset to 0.0 at waypoint\n\r");
+}
+
+void loopTurnTo(void) {
+    const float relativeTurnAngle = -45.0f;  // Turn 45° from starting position
+    const float fixedSteering = 0.75f;      // Fixed turn radius
+    const float Kp = 0.05f;                 // Proportional gain
+    const float maxThrottle = 1.0f;         // Maximum throttle
+    const float minThrottle = 0.5f;         // Minimum throttle to overcome friction
+    
+    const uint32_t printIntervalMs = 100;
+    const uint32_t heartbeatIntervalMs = 1000;
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    float unwrappedYaw = 0.0f;
+    float targetYaw = 0.0f;
+    bool initialized = false;
+
+    printf("\n\r[Turn To Angle] Relative Target: +%.2f°, Steering: %.2f\n\r", relativeTurnAngle, fixedSteering);
+
+    // Set fixed steering angle (invert if turning positive direction)
+    float adjustedSteering = (relativeTurnAngle > 0.0f) ? -fixedSteering : fixedSteering;
+    Turning_SetAngle(adjustedSteering);
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // Drain CAN messages
+        drainAndUpdateCANMessages();
+
+        // Read current orientation
+        Orientation orient;
+        bool hasOrientation = readOrientation(&orient, 0);
+
+        float throttle = 0.0f;
+        float error = 0.0f;
+
+        if (hasOrientation) {
+            if (!initialized) {
+                // First reading - establish baseline and target
+                unwrappedYaw = orient.yaw;
+                targetYaw = unwrappedYaw + relativeTurnAngle;
+                initialized = true;
+                printf("Initial yaw: %.2f° | Target: %.2f° (unwrapped)\n\r", unwrappedYaw, targetYaw);
+            } else {
+                // Unwrap current yaw
+                float wrappedPrev = fmodf(unwrappedYaw, 360.0f);
+                if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
+                
+                float delta = orient.yaw - wrappedPrev;
+                
+                // Normalize delta to [-180, 180]
+                while (delta > 180.0f) delta -= 360.0f;
+                while (delta < -180.0f) delta += 360.0f;
+                
+                unwrappedYaw += delta;
+            }
+
+            // Calculate error in unwrapped space (no normalization needed!)
+            error = unwrappedYaw - targetYaw;
+            
+            // P controller
+            throttle = Kp * error;
+
+            // Apply minimum throttle when error is significant
+            if (fabsf(error) > 1.0f) {  // Dead band of 1 degree
+                if (throttle > 0.0f && throttle < minThrottle) throttle = minThrottle;
+                if (throttle < 0.0f && throttle > -minThrottle) throttle = -minThrottle;
+            } else {
+                throttle = 0.0f;  // Stop when close enough
+            }
+
+            // Clamp throttle
+            if (throttle > maxThrottle) throttle = maxThrottle;
+            if (throttle < -maxThrottle) throttle = -maxThrottle;
+
+            // Apply throttle
+            SetEscSpeed(throttle);
+        }
+
+        // Periodically print status
+        if (now - lastPrint >= printIntervalMs)
+        {
+            if (hasOrientation && initialized) {
+                printf("Wrapped: %6.2f° | Unwrapped: %8.2f° | Error: %+6.2f° | Throttle: %+5.3f\n\r", 
+                       orient.yaw, unwrappedYaw, error, throttle);
+            } else if (hasOrientation) {
+                printf("Initializing...\n\r");
+            } else {
+                printf("Orientation: [No data]\n\r");
+            }
+            lastPrint = now;
+        }
+
+        // Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Turn To Angle] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
+void waypointLoop(void) {
+    // ========== CONFIGURABLE CONSTANTS ==========
+    const uint32_t countsPerMeter = 16066;        // Encoder counts per meter of travel
+    const float turnDiameter = 1.14f;             // Turn diameter in meters (at steering = 0.6)
+    const float turnSteering = 0.6f;              // Steering value for the turn
+    const float segLength = 1.0f;                 // Length of straight segments (meters)
+    const float ledBlinkDuration = 0.05f;         // LED on duration (meters)
+    
+    // ========== CALCULATED TRAJECTORY PARAMETERS ==========
+    const float turnRadius = turnDiameter / 2.0f;                    // r = 0.57 m
+    const float arcLength = 3.14159265f * turnRadius;                // s = π × r ≈ 1.79 m
+    
+    // Key positions along trajectory (in meters)
+    const float pos_seg1_mid = segLength / 2.0f;                     // Midpoint of first straight
+    const float pos_arc_start = segLength;                           // Arc begins
+    const float pos_arc_mid = segLength + (arcLength / 2.0f);        // Arc midpoint
+    const float pos_arc_end = segLength + arcLength;                 // Arc ends
+    const float pos_seg2_mid = pos_arc_end + (segLength / 2.0f);     // Midpoint of second straight
+    const float pos_total = pos_arc_end + segLength;                 // Total trajectory length
+    
+    // ========== WAYPOINT EVENT ARRAY ==========
+    EncoderEvent events[] = {
+        // First straight segment - LED blink at midpoint
+        {.waypoint = pos_seg1_mid * countsPerMeter,                           .callback = ledOn},
+        {.waypoint = (pos_seg1_mid + ledBlinkDuration) * countsPerMeter,      .callback = ledOff},
+        
+        // Arc segment - Enable steering and LED events at start/mid/end
+        {.waypoint = pos_arc_start * countsPerMeter,                          .callback = setSteering},
+        {.waypoint = pos_arc_start * countsPerMeter,                          .callback = ledOn},
+        {.waypoint = (pos_arc_start + ledBlinkDuration) * countsPerMeter,     .callback = ledOff},
+        
+        {.waypoint = pos_arc_mid * countsPerMeter,                            .callback = ledOn},
+        {.waypoint = (pos_arc_mid + ledBlinkDuration) * countsPerMeter,       .callback = ledOff},
+        
+        {.waypoint = pos_arc_end * countsPerMeter,                            .callback = ledOn},
+        {.waypoint = (pos_arc_end + ledBlinkDuration) * countsPerMeter,       .callback = ledOff},
+        {.waypoint = pos_arc_end * countsPerMeter,                            .callback = unsetSteering},
+        
+        // Second straight segment - LED blink at midpoint
+        {.waypoint = pos_seg2_mid * countsPerMeter,                           .callback = ledOn},
+        {.waypoint = (pos_seg2_mid + ledBlinkDuration) * countsPerMeter,      .callback = ledOff},
+        
+        // Stop at end of trajectory and turn LED on
+        {.waypoint = pos_total * countsPerMeter,                              .callback = StopCarEsc},
+        {.waypoint = pos_total * countsPerMeter,                              .callback = ledOn},
+    };
+    const uint8_t numEvents = sizeof(events) / sizeof(events[0]);
+    
+    // Track which events have been triggered
+    bool triggered[numEvents];
+    for (uint8_t i = 0; i < numEvents; i++) {
+        triggered[i] = false;
+    }
+    
+    const uint32_t printIntervalMs = 100;
+    uint32_t lastPrint = HAL_GetTick();
+    
+    printf("\n\r[Waypoint Loop] Starting with %u waypoints...\n\r", numEvents);
+    for (uint8_t i = 0; i < numEvents; i++) {
+        printf("  Waypoint %u: encoder = %ld\n\r", i, (long)events[i].waypoint);
+    }
+    
+    SetEscSpeed(0.6f);  // Start moving forward
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+        
+        // Drain CAN and read current encoder position
+        drainAndUpdateCANMessages();
+        int32_t currentPosition = readEncoder(0);
+        
+        // Check each waypoint
+        for (uint8_t i = 0; i < numEvents; i++) {
+            if (!triggered[i] && currentPosition >= events[i].waypoint) {
+                // Trigger the callback
+                if (events[i].callback != NULL) {
+                    events[i].callback();
+                }
+                triggered[i] = true;
+            }
+        }
+        
+        // Periodically print encoder position
+        if (now - lastPrint >= printIntervalMs) {
+            printf("Encoder: %ld\n\r", (long)currentPosition);
+            lastPrint = now;
+        }
+        
+        HAL_Delay(1);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -797,11 +1087,17 @@ Error_Handler();
   HAL_TIM_PWM_Start(&htim13, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1);
   Turning_SetAngle(0);
+  SetEscSpeed(0);
+  HAL_Delay(500);
 //  loopPrintAllCAN();
- loopPrintAll();
+  loopPrintAll();
 //  loopPrintEncoder();
 //  loopPrintOrientation();
-  // loopPrintMotorControl();
+//  loopPrintMotorControl();
+//  loopTurnTo();
+//  debugLoop();
+//  loopPrintUnwrapped();
+//    waypointLoop();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1163,6 +1459,7 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
@@ -1171,7 +1468,17 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LD1_Pin|LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : LD4_Pin */
+  GPIO_InitStruct.Pin = LD4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD4_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;

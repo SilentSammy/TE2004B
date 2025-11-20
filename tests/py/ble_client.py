@@ -5,6 +5,7 @@ BLE Keyboard/Gamepad Control - WASD or gamepad for throttle/steering, X for LED
 import asyncio
 from bleak import BleakScanner, BleakClient
 import combined_input as inp
+from pathlib import Path
 
 TARGET_DEVICE_NAME = "BLE_Sensor_Hub"
 SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
@@ -12,8 +13,14 @@ CHAR_UUID_LED = "12345678-1234-5678-1234-56789abcdef1"
 CHAR_UUID_THROTTLE = "12345678-1234-5678-1234-56789abcdef2"
 CHAR_UUID_STEERING = "12345678-1234-5678-1234-56789abcdef3"
 
-THROTTLE_SCALE = 1.0
-STEERING_SCALE = 0.75
+def load_scales():
+    try:
+        config_path = Path(__file__).parent / "scales.txt"
+        with open(config_path) as f:
+            lines = f.read().strip().split('\n')
+            return float(lines[0]), float(lines[1])
+    except:
+        return 1.0, 0.65
 
 def to_byte(val):
     return int((val + 1) * 127.5)
@@ -41,6 +48,8 @@ async def control_loop():
         
         try:
             while True:
+                THROTTLE_SCALE, STEERING_SCALE = load_scales()
+                
                 throttle = to_byte(inp.get_bipolar_ctrl('w', 's', 'LY') * THROTTLE_SCALE)
                 steering = to_byte(inp.get_bipolar_ctrl('d', 'a', 'RX') * STEERING_SCALE)
                 
