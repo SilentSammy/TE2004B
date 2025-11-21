@@ -33,7 +33,6 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 typedef struct {
     uint32_t id;           // CAN identifier (11-bit standard or 29-bit extended)
     uint8_t  data[64];     // Payload (supports CAN-FD up to 64 bytes)
@@ -64,6 +63,12 @@ typedef struct {
     float ay;  // Linear acceleration along Y-axis (m/s²)
     float az;  // Linear acceleration along Z-axis (m/s²)
 } LinearAcceleration;
+
+typedef struct {
+    float x;     // X position in meters
+    float y;     // Y position in meters
+    float w; // Angle (omega) in degrees
+} PseudoGPS;
 
 typedef struct {
     int32_t waypoint;  // Encoder count at which to trigger the event
@@ -117,7 +122,8 @@ CANMessage latestMsgs[] = {
     {.id = 0x124, .length = 0, .timestamp = 0, .isExtended = false},  // Orientation
     {.id = 0x125, .length = 0, .timestamp = 0, .isExtended = false},  // Motor Control
     {.id = 0x126, .length = 0, .timestamp = 0, .isExtended = false},  // Angular Velocity
-    {.id = 0x127, .length = 0, .timestamp = 0, .isExtended = false}   // Linear Acceleration
+	{.id = 0x127, .length = 0, .timestamp = 0, .isExtended = false},   // Linear Acceleration
+    {.id = 0x128, .length = 0, .timestamp = 0, .isExtended = false}   // Linear Acceleration
 };
 #define NUM_CAN_IDS (sizeof(latestMsgs) / sizeof(latestMsgs[0]))
 /* USER CODE END PV */
@@ -553,6 +559,61 @@ bool readLinearAcceleration(LinearAcceleration* accel, int32_t timeoutMs /* = -1
     return (accelMsg != NULL && accelMsg->timestamp > 0);
 }
 
+bool readPseudoGPS(PseudoGPS* gps, int32_t timeoutMs /* = -1 */)
+{
+    static PseudoGPS lastGPS = {0.0f, 0.0f, 0.0f};
+
+    if (gps == NULL) {
+        return false;
+    }
+
+    if (timeoutMs == -1)
+        timeoutMs = 200;
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+    int framesRead = drainAndUpdateCANMessages();
+
+    CANMessage* gpsMsg = getCANMessageByID(0x128);
+    if (gpsMsg != NULL && gpsMsg->length >= 8) {
+        // Decode big-endian format (MSB first)
+        // X Position: bytes 2-3
+        uint16_t x_raw = ((uint16_t)gpsMsg->data[2] << 8) | (uint16_t)gpsMsg->data[3];
+        // Y Position: bytes 4-5
+        uint16_t y_raw = ((uint16_t)gpsMsg->data[4] << 8) | (uint16_t)gpsMsg->data[5];
+        // Width: bytes 6-7 (using as omega/angle)
+        uint16_t w_raw = ((uint16_t)gpsMsg->data[6] << 8) | (uint16_t)gpsMsg->data[7];
+
+        // Convert to float (pixels or appropriate units)
+        lastGPS.x = (float)x_raw;
+        lastGPS.y = (float)y_raw;
+        lastGPS.w = (float)w_raw;
+    }
+
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                gpsMsg = getCANMessageByID(0x128);
+                if (gpsMsg != NULL && gpsMsg->length >= 8) {
+                    uint16_t x_raw = ((uint16_t)gpsMsg->data[2] << 8) | (uint16_t)gpsMsg->data[3];
+                    uint16_t y_raw = ((uint16_t)gpsMsg->data[4] << 8) | (uint16_t)gpsMsg->data[5];
+                    uint16_t w_raw = ((uint16_t)gpsMsg->data[6] << 8) | (uint16_t)gpsMsg->data[7];
+
+                    lastGPS.x = (float)x_raw;
+                    lastGPS.y = (float)y_raw;
+                    lastGPS.w = (float)w_raw;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
+    *gps = lastGPS;
+    return (gpsMsg != NULL && gpsMsg->timestamp > 0);
+}
+
 void loopPrintEncoder(void)
 {
     const uint32_t printIntervalMs = 100;   // print every 100 ms
@@ -613,6 +674,41 @@ void loopPrintOrientation(void) {
         if (now - lastHeartbeat >= heartbeatIntervalMs)
         {
             printf("[Orientation Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
+void loopPrintPseudoGPS(void) {
+    const uint32_t printIntervalMs = 100;      // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[Pseudo-GPS Monitor] Starting...\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // 1) Periodically read pseudo-GPS values
+        if (now - lastPrint >= printIntervalMs)
+        {
+            PseudoGPS gps;
+            if (readPseudoGPS(&gps, -1)) {
+                printf("X: %7.1f | Y: %7.1f | Omega: %7.1f\n\r", gps.x, gps.y, gps.w);
+            } else {
+                printf("Pseudo-GPS: [No data]\n\r");
+            }
+            lastPrint = now;
+        }
+
+        // 2) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Pseudo-GPS Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
             lastHeartbeat = now;
         }
 
@@ -750,10 +846,12 @@ void loopPrintAll(void) {
             Orientation orient;
             AngularVelocity angvel;
             LinearAcceleration accel;
+            PseudoGPS gps;
             bool hasOrientation = readOrientation(&orient, 0);
             bool hasAngvel = readAngularVelocity(&angvel, 0);
             bool hasAccel = readLinearAcceleration(&accel, 0);
             bool hasControl = readMotorControl(&control, 0);
+            bool hasGPS = readPseudoGPS(&gps, 0);
 
             printf("Enc:%8ld | ", (long)encoderCount);
             
@@ -773,6 +871,12 @@ void loopPrintAll(void) {
                 printf("Ax:%+5.2f Ay:%+5.2f Az:%+5.2f | ", accel.ax, accel.ay, accel.az);
             } else {
                 printf("Accel:[No data] | ");
+            }
+
+            if (hasGPS) {
+                printf("GPS X:%5.0f Y:%5.0f W:%5.0f | ", gps.x, gps.y, gps.w);
+            } else {
+                printf("GPS:[No data] | ");
             }
 
             if (hasControl) {
@@ -925,7 +1029,7 @@ void waypointLoop(void) {
     const uint32_t countsPerMeter = 16066;        // Encoder counts per meter of travel
     const float turnDiameter = 1.14f;             // Turn diameter in meters (at steering = 0.6)
     const float turnSteering = 0.6f;              // Steering value for the turn
-    const float segLength = 1.0f;                 // Length of straight segments (meters)
+    const float segLength = 0.5f;                 // Length of straight segments (meters)
     const float ledBlinkDuration = 0.05f;         // LED on duration (meters)
     
     // ========== CALCULATED TRAJECTORY PARAMETERS ==========
@@ -964,7 +1068,7 @@ void waypointLoop(void) {
         
         // Stop at end of trajectory and turn LED on
         {.waypoint = pos_total * countsPerMeter,                              .callback = StopCarEsc},
-        {.waypoint = pos_total * countsPerMeter,                              .callback = ledOn},
+        // {.waypoint = pos_total * countsPerMeter,                              .callback = ledOn},
     };
     const uint8_t numEvents = sizeof(events) / sizeof(events[0]);
     
@@ -982,7 +1086,7 @@ void waypointLoop(void) {
         printf("  Waypoint %u: encoder = %ld\n\r", i, (long)events[i].waypoint);
     }
     
-    SetEscSpeed(0.6f);  // Start moving forward
+    SetEscSpeed(1.0f);  // Start moving forward
 
     while (1)
     {
@@ -1089,15 +1193,16 @@ Error_Handler();
   Turning_SetAngle(0);
   SetEscSpeed(0);
   HAL_Delay(500);
-//  loopPrintAllCAN();
-  loopPrintAll();
+//   loopPrintAllCAN();
+//  loopPrintAll();
 //  loopPrintEncoder();
 //  loopPrintOrientation();
 //  loopPrintMotorControl();
 //  loopTurnTo();
 //  debugLoop();
 //  loopPrintUnwrapped();
-//    waypointLoop();
+    waypointLoop();
+//    loopPrintPseudoGPS();
   /* USER CODE END 2 */
 
   /* Infinite loop */

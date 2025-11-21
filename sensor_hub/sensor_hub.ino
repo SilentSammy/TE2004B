@@ -1,6 +1,7 @@
 #include <SPI.h>
 #include <mcp_can.h>
 #include <Wire.h>
+#include "ble_client.h"
 
 // Debug configuration
 #define DEBUG_BLE false  // Set to true for verbose BLE control messages
@@ -32,11 +33,13 @@ const unsigned long ORIENT_INTERVAL = 20;   // Orientation CAN at 50Hz (20ms)
 const unsigned long CONTROL_INTERVAL = 50;  // Control CAN at 20Hz (50ms)
 const unsigned long ANGVEL_INTERVAL = 20;   // Angular velocity CAN at 50Hz (20ms)
 const unsigned long ACCEL_INTERVAL = 20;    // Acceleration CAN at 50Hz (20ms)
+const unsigned long CAMERA_INTERVAL = 50;   // Camera data CAN at 20Hz (50ms)
 byte txData[8] = {0};                       // CAN message buffer (encoder)
 byte orientData[8] = {0};                   // CAN message buffer (orientation)
 byte controlData[8] = {0};                  // CAN message buffer (motor control)
 byte angvelData[8] = {0};                   // CAN message buffer (angular velocity)
 byte accelData[8] = {0};                    // CAN message buffer (linear acceleration)
+byte cameraData[8] = {0};                   // CAN message buffer (camera position)
 bool canInitialized = false;
 
 // Encoder variables (functions in encoder.ino)
@@ -51,6 +54,9 @@ unsigned long lastMpuTime = 0;
 unsigned long lastOrientTxTime = 0;
 unsigned long lastAngvelTxTime = 0;
 unsigned long lastAccelTxTime = 0;
+
+// BLE Camera Client variables
+unsigned long lastCameraTxTime = 0;
 
 // BLE Control variables
 float currentThrottle = 0.0;  // -1.0 to 1.0
@@ -186,6 +192,27 @@ void sendLinearAccelCAN(float ax, float ay, float az) {
   CAN0.sendMsgBuf(0x127, 0, 8, accelData);
 }
 
+void sendCameraPositionCAN(const uint8_t* data) {
+  // Copy camera data to CAN buffer
+  for (int i = 0; i < 8; i++) {
+    cameraData[i] = data[i];
+  }
+  
+  // Send on CAN ID 0x128
+  byte sndStat = CAN0.sendMsgBuf(0x128, 0, 8, cameraData);
+  
+  if (sndStat == CAN_OK) {
+    Serial.print("Camera CAN TX: ");
+    for (int i = 0; i < 8; i++) {
+      Serial.print("0x");
+      if (cameraData[i] < 0x10) Serial.print("0");
+      Serial.print(cameraData[i], HEX);
+      if (i < 7) Serial.print(" ");
+    }
+    Serial.println();
+  }
+}
+
 // Helpers
 inline void fastStatusPrint(bool sent, long pos) {
   Serial.write(sent ? 'Y' : 'N');  // 1 char: Y or N
@@ -233,6 +260,10 @@ void setup() {
   BLE_addCharacteristic(CHARACTERISTIC_UUID_STEERING, onSteeringControl);
   BLE_start(DEVICE_NAME);
   
+  // BLE Camera Client setup
+  Serial.println("Initializing BLE Camera Client...");
+  bleClientInit();
+  
   Serial.println("System Ready!");
   Serial.println();
   
@@ -259,6 +290,22 @@ void loop() {
   if (!canInitialized) return;
 
   unsigned long now = millis();
+  
+  // ========== BLE CAMERA CLIENT UPDATE ==========
+  bleClientUpdate();
+  
+  // ========== CAMERA DATA CAN TX (Event + Periodic) ==========
+  if (bleClientIsConnected()) {
+    bool cameraDueByTimeout = (now - lastCameraTxTime >= CAMERA_INTERVAL);
+    
+    if (bleClientHasNewData() || cameraDueByTimeout) {
+      lastCameraTxTime = now;
+      uint8_t cameraBuffer[8];
+      if (bleClientGetData(cameraBuffer)) {
+        sendCameraPositionCAN(cameraBuffer);
+      }
+    }
+  }
   
   // ========== IMU READS (Every loop, ~100Hz) ==========
   float dt = (now - lastMpuTime) / 1000.0;
