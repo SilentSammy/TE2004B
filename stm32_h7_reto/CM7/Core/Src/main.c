@@ -75,6 +75,14 @@ typedef struct {
     void (*callback)(void); // Function pointer to execute when waypoint is reached
 } EncoderEvent;
 
+typedef struct {
+    float x;            // Target X coordinate
+    float y;            // Target Y coordinate
+    float margin;       // Half-width of square tolerance region (±margin in both x and y)
+    int eventType;      // Event type: 0=LED, 1=Steering, 2=Throttle, etc.
+    float eventArg;     // Event argument (e.g., LED state, steering angle, throttle value)
+} Waypoint2D;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -911,8 +919,8 @@ void ledOff(void) {
 }
 
 void setSteering(void) {
-    Turning_SetAngle(0.6f);
-    printf("Steering set to 0.6 at waypoint\n\r");
+    Turning_SetAngle(0.7f);
+    printf("Steering set to 0.7 at waypoint\n\r");
 }
 
 void unsetSteering(void) {
@@ -1027,8 +1035,9 @@ void loopTurnTo(void) {
 void waypointLoop(void) {
     // ========== CONFIGURABLE CONSTANTS ==========
     const uint32_t countsPerMeter = 16066;        // Encoder counts per meter of travel
-    const float turnDiameter = 1.14f;             // Turn diameter in meters (at steering = 0.6)
-    const float turnSteering = 0.6f;              // Steering value for the turn
+//    const float turnDiameter = 1.14f;             // Turn diameter in meters (at steering = 0.6)
+    const float turnDiameter = 0.97f;			// Turn diameter in meters (at steering = 0.7)
+    const float turnSteering = 0.7f;              // Steering value for the turn
     const float segLength = 0.5f;                 // Length of straight segments (meters)
     const float ledBlinkDuration = 0.05f;         // LED on duration (meters)
     
@@ -1116,6 +1125,97 @@ void waypointLoop(void) {
         HAL_Delay(1);
     }
 }
+
+void waypoint2DLoop(void) {
+    // ========== BASE ACTUATOR STATES ==========
+    float baseLedState = 0.0f;      // LED this by default
+    float baseSteering = 0.0f;      // Steering this by default
+    float baseThrottle = 0.8f;      // Throttle this by default
+    
+    // ========== WAYPOINT ARRAY ==========
+    Waypoint2D waypoints[] = {
+        {.x = 17.0f,   .y = 113.0f, .margin = 5.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (17, 113)
+        {.x = 42.0f,   .y = 113.0f, .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (42, 113)
+        {.x = 69.0f,   .y = 114.0f, .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (69, 114)
+        {.x = 126.0f,  .y = 62.0f,  .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (126, 62)
+        {.x = 130.5f,  .y = 62.0f,  .margin = 61.5f, .eventType = 1, .eventArg = 0.7f},  // STEERING at (130.5, 62)
+        {.x = 76.0f,   .y = 7.0f,   .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (76, 7)
+        {.x = 46.0f,   .y = 7.0f,   .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (46, 7)
+        {.x = 8.0f,    .y = 5.0f,   .margin = 8.0f, .eventType = 2, .eventArg = 0.0f}   // STOP at (8, 5)
+    };
+    const uint8_t numWaypoints = sizeof(waypoints) / sizeof(waypoints[0]);
+    
+    const uint32_t printIntervalMs = 1000;
+    uint32_t lastPrint = HAL_GetTick();
+    
+    printf("\n\r[Waypoint2D Loop] Starting with %u waypoints...\n\r", numWaypoints);
+    for (uint8_t i = 0; i < numWaypoints; i++) {
+        printf("  Waypoint %u: pos=(%.1f, %.1f), margin=%.1f, type=%d, arg=%.2f\n\r", 
+               i, waypoints[i].x, waypoints[i].y, waypoints[i].margin, 
+               waypoints[i].eventType, waypoints[i].eventArg);
+    }
+    
+    while (1) {
+        uint32_t now = HAL_GetTick();
+        
+        // Initialize actuator values with base states
+        float currentLed = baseLedState;
+        float currentSteering = baseSteering;
+        float currentThrottle = baseThrottle;
+        
+        // Drain CAN messages and read current position
+        drainAndUpdateCANMessages();
+        PseudoGPS gps;
+        bool hasGPS = readPseudoGPS(&gps, 0);
+        bool insideWaypoint = false;
+        
+        if (hasGPS) {
+            // Loop through all waypoints and check if any are satisfied
+            for (uint8_t i = 0; i < numWaypoints; i++) {
+                // Check if current position is within waypoint region
+                float dx = fabsf(gps.x - waypoints[i].x);
+                float dy = fabsf(gps.y - waypoints[i].y);
+                
+                if (dx <= waypoints[i].margin && dy <= waypoints[i].margin) {
+                    // Position is inside waypoint region - apply event
+                    insideWaypoint = true;
+                    switch (waypoints[i].eventType) {
+                        case 0:  // LED event
+                            currentLed = waypoints[i].eventArg;
+                            break;
+                        case 1:  // Steering event
+                            currentSteering = waypoints[i].eventArg;
+                            break;
+                        case 2:  // Throttle event
+                            currentThrottle = waypoints[i].eventArg;
+                            break;
+                    }
+                }
+            }
+        }
+        
+        // Update all actuator states
+        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, (currentLed > 0.5f) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        Turning_SetAngle(currentSteering);
+        SetEscSpeed(currentThrottle);
+        
+        // Periodic debug print
+        if (now - lastPrint >= printIntervalMs) {
+            if (hasGPS) {
+                printf("Pos: (%.1f, %.1f) | LED:%.1f Str:%.2f Thr:%.2f | WP:%s\n\r",
+                       gps.x, gps.y, currentLed, currentSteering, currentThrottle,
+                       insideWaypoint ? "ACTIVE" : "---");
+            } else {
+                printf("GPS: [No data] | LED:%.1f Str:%.2f Thr:%.2f\n\r",
+                       currentLed, currentSteering, currentThrottle);
+            }
+            lastPrint = now;
+        }
+        
+        HAL_Delay(10);  // 100 Hz update rate
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -1201,7 +1301,8 @@ Error_Handler();
 //  loopTurnTo();
 //  debugLoop();
 //  loopPrintUnwrapped();
-    waypointLoop();
+      waypointLoop();
+//      waypoint2DLoop();
 //    loopPrintPseudoGPS();
   /* USER CODE END 2 */
 
