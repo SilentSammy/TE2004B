@@ -1,0 +1,46 @@
+# STM32 Build Artifacts
+Debug/
+Release/
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.d
+*.cyclo
+
+# STM32CubeIDE / Eclipse
+.settings/
+language.settings.xml
+stm32cubeide.project.prefs
+.cproject
+.project
+.metadata/
+*.launch
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
