@@ -1,0 +1,3 @@
+[submodule "PCB"]
+	path = PCB
+	url = https://github.com/SoniDavid/TE2004B_EmbeddedSystems_PCB
