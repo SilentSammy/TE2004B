@@ -782,6 +782,39 @@ void loopPrintUnwrapped(void) {
     }
 }
 
+/**
+ * @brief Unwrap angle to avoid discontinuities at ±180°
+ * @param wrappedAngle Current wrapped angle reading (0-360° or -180 to +180°)
+ * @return Unwrapped continuous angle value
+ */
+float unwrapAngle(float wrappedAngle) {
+    static float unwrappedValue = 0.0f;
+    static bool initialized = false;
+    
+    if (!initialized) {
+        // First call - initialize with current angle
+        unwrappedValue = wrappedAngle;
+        initialized = true;
+        return unwrappedValue;
+    }
+    
+    // Calculate previous wrapped equivalent
+    float wrappedPrev = fmodf(unwrappedValue, 360.0f);
+    if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
+    
+    // Calculate delta with current reading
+    float delta = wrappedAngle - wrappedPrev;
+    
+    // Normalize delta to [-180, 180]
+    while (delta > 180.0f) delta -= 360.0f;
+    while (delta < -180.0f) delta += 360.0f;
+    
+    // Update unwrapped value
+    unwrappedValue += delta;
+    
+    return unwrappedValue;
+}
+
 void loopPrintMotorControl(void) {
     const uint32_t printIntervalMs = 100;      // print every 100 ms
     const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
@@ -1216,6 +1249,110 @@ void waypoint2DLoop(void) {
     }
 }
 
+void navigationLoop(void) {
+    // Target waypoint for navigation
+    const float targetX = 90.0f;
+    const float targetY = 60.0f;
+    
+    // Control parameters
+    const float Kp = 0.05f;  // Proportional gain for steering control (doubled)
+    const float maxSteering = 0.85f;  // Maximum steering limit
+    const float waypointRadius = 5.0f;  // Stop within 5 units of target
+    const float movingThrottle = 0.8f;
+    
+    const uint32_t printIntervalMs = 1000;
+    uint32_t lastPrint = HAL_GetTick();
+    
+    printf("\n\r[Navigation Loop] Starting navigation to (%.1f, %.1f)...\n\r", targetX, targetY);
+    
+    while (1) {
+        uint32_t now = HAL_GetTick();
+        
+        // Drain CAN messages and read current position and orientation
+        drainAndUpdateCANMessages();
+        PseudoGPS gps;
+        bool hasGPS = readPseudoGPS(&gps, 0);
+        
+        float steering = 0.0f;
+        float throttle = 0.0f;
+        float angleError = 0.0f;
+        float distance = 0.0f;
+        
+        if (hasGPS) {
+            // Get unwrapped heading angle
+            float unwrappedHeading = unwrapAngle(gps.w);
+            
+            // Calculate distance and angle to target waypoint
+            float dx = targetX - gps.x;
+            float dy = targetY - gps.y;
+            distance = sqrtf(dx * dx + dy * dy);
+            float targetAngle = atan2f(dy, dx) * 180.0f / 3.14159265f;  // Convert to degrees
+            
+            // Calculate angle error (difference between car's heading and target angle)
+            angleError = targetAngle - unwrappedHeading;
+            
+            // Normalize angle error to [-180, 180]
+            while (angleError > 180.0f) angleError -= 360.0f;
+            while (angleError < -180.0f) angleError += 360.0f;
+            
+            // Determine if we need to reverse
+            bool shouldReverse = fabsf(angleError) > 90.0f;
+            
+            // When reversing, flip the angle error by 180° to point backwards
+            if (shouldReverse) {
+                // Add/subtract 180° to flip the target direction
+                if (angleError > 0.0f) {
+                    angleError -= 180.0f;
+                } else {
+                    angleError += 180.0f;
+                }
+            }
+            
+            // Apply proportional control and invert direction
+            // Negative sign inverts: positive error now means turn left (negative steering)
+            steering = -Kp * angleError;
+            
+            // If reversing, invert steering (car steers opposite direction in reverse)
+            if (shouldReverse) {
+                steering = -steering;
+            }
+            
+            // Clamp steering to [-0.8, 0.8]
+            if (steering > maxSteering) steering = maxSteering;
+            if (steering < -maxSteering) steering = -maxSteering;
+            
+            // Throttle control based on distance and reverse state
+            if (distance > waypointRadius) {
+                if (shouldReverse) {
+                    throttle = -movingThrottle;  // Reverse
+                } else {
+                    throttle = movingThrottle;   // Forward
+                }
+            } else {
+                throttle = 0.0f;  // Stop at waypoint
+                steering = 0.0f;  // Also stop steering at waypoint
+            }
+        }
+        
+        // Update actuators
+        Turning_SetAngle(steering);
+        SetEscSpeed(throttle);
+        
+        // Periodic debug print
+        if (now - lastPrint >= printIntervalMs) {
+            if (hasGPS) {
+                printf("Pos: (%.1f, %.1f) Heading: %.1f° | Target: (%.1f, %.1f) | Dist: %.1f | Error: %+.1f° | Str: %+.3f | Thr: %.2f\n\r",
+                       gps.x, gps.y, gps.w, targetX, targetY, distance, angleError, steering, throttle);
+            } else {
+                printf("GPS: [No data]\n\r");
+            }
+            lastPrint = now;
+        }
+        
+        HAL_Delay(10);  // 100 Hz update rate
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -1293,17 +1430,18 @@ Error_Handler();
   Turning_SetAngle(0);
   SetEscSpeed(0);
   HAL_Delay(500);
-//   loopPrintAllCAN();
-//  loopPrintAll();
+//  loopPrintAllCAN();
+  loopPrintAll();
 //  loopPrintEncoder();
 //  loopPrintOrientation();
 //  loopPrintMotorControl();
 //  loopTurnTo();
 //  debugLoop();
 //  loopPrintUnwrapped();
-      waypointLoop();
-//      waypoint2DLoop();
-//    loopPrintPseudoGPS();
+//  waypointLoop();
+//  waypoint2DLoop();
+//  loopPrintPseudoGPS();
+//    navigationLoop();
   /* USER CODE END 2 */
 
   /* Infinite loop */
