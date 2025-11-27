@@ -13,11 +13,12 @@ async def example_loop():
     await car.connect()
     
     try:
-        # Example 1: Set constant values
-        await car.set_throttle(0.5)    # 50% forward
-        await car.set_steering(0.3)    # 30% right
-        await car.set_omega(0.0)       # no rotation
-        await car.set_waypoint(10.0, 20.0, 45.0)  # Set waypoint to (10, 20) with 45 degrees orientation
+        while True:
+            # Example 1: Set constant values
+            await car.set_throttle(0.5)    # 50% forward
+            await car.set_steering(0.3)    # 30% right
+            await car.set_omega(0.0)       # no rotation
+            await car.set_waypoint(10.0, 20.0, 45.0)  # Set waypoint to (10, 20) with 45 degrees orientation
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")
