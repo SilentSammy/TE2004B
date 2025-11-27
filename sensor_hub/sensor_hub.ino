@@ -23,6 +23,7 @@
 #define CHARACTERISTIC_UUID_LED      "12345678-1234-5678-1234-56789abcdef1"
 #define CHARACTERISTIC_UUID_THROTTLE "12345678-1234-5678-1234-56789abcdef2"
 #define CHARACTERISTIC_UUID_STEERING "12345678-1234-5678-1234-56789abcdef3"
+#define CHARACTERISTIC_UUID_OMEGA    "12345678-1234-5678-1234-56789abcdef4"
 #define DEVICE_NAME "BLE_Sensor_Hub"
 
 // CAN configuration
@@ -61,6 +62,7 @@ unsigned long lastCameraTxTime = 0;
 // BLE Control variables
 float currentThrottle = 0.0;  // -1.0 to 1.0
 float currentSteering = 0.0;  // -1.0 to 1.0
+float currentOmega = 0.0;     // -1.0 to 1.0
 unsigned long lastControlTxTime = 0;
 bool controlChanged = false;
 
@@ -90,6 +92,15 @@ void onSteeringControl(uint8_t value) {
   if (DEBUG_BLE) {
     Serial.print("Steering: ");
     Serial.println(currentSteering, 3);
+  }
+}
+
+void onOmegaControl(uint8_t value) {
+  currentOmega = toBipolar(value);
+  controlChanged = true;
+  if (DEBUG_BLE) {
+    Serial.print("Omega: ");
+    Serial.println(currentOmega, 3);
   }
 }
 
@@ -130,14 +141,15 @@ void sendControlCAN() {
   // Convert float (-1.0 to +1.0) to int16_t (-1000 to +1000)
   int16_t throttle_enc = (int16_t)(currentThrottle * 1000);
   int16_t steering_enc = (int16_t)(currentSteering * 1000);
+  int16_t omega_enc = (int16_t)(currentOmega * 1000);
   
   // Pack into CAN message (little-endian)
   controlData[0] = (byte)(throttle_enc);
   controlData[1] = (byte)(throttle_enc >> 8);
   controlData[2] = (byte)(steering_enc);
   controlData[3] = (byte)(steering_enc >> 8);
-  controlData[4] = 0;
-  controlData[5] = 0;
+  controlData[4] = (byte)(omega_enc);
+  controlData[5] = (byte)(omega_enc >> 8);
   controlData[6] = 0;
   controlData[7] = 0;
   
@@ -148,7 +160,9 @@ void sendControlCAN() {
     Serial.print("CAN Control TX - T:");
     Serial.print(currentThrottle, 2);
     Serial.print(" S:");
-    Serial.println(currentSteering, 2);
+    Serial.print(currentSteering, 2);
+    Serial.print(" W:");
+    Serial.println(currentOmega, 2);
   }
 }
 
@@ -258,6 +272,7 @@ void setup() {
   BLE_addCharacteristic(CHARACTERISTIC_UUID_LED, onLedControl);
   BLE_addCharacteristic(CHARACTERISTIC_UUID_THROTTLE, onThrottleControl);
   BLE_addCharacteristic(CHARACTERISTIC_UUID_STEERING, onSteeringControl);
+  BLE_addCharacteristic(CHARACTERISTIC_UUID_OMEGA, onOmegaControl);
   BLE_start(DEVICE_NAME);
   
   // BLE Camera Client setup

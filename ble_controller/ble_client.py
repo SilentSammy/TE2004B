@@ -12,6 +12,7 @@ SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
 CHAR_UUID_LED = "12345678-1234-5678-1234-56789abcdef1"
 CHAR_UUID_THROTTLE = "12345678-1234-5678-1234-56789abcdef2"
 CHAR_UUID_STEERING = "12345678-1234-5678-1234-56789abcdef3"
+CHAR_UUID_OMEGA = "12345678-1234-5678-1234-56789abcdef4"
 
 def load_scales():
     try:
@@ -23,7 +24,10 @@ def load_scales():
         return 1.0, 0.65
 
 def to_byte(val):
-    return int((val + 1) * 127.5)
+    # Convert -1.0 to +1.0 range to 0-255 byte
+    # Matches C toBipolar: (value - 128) / 128.0
+    result = int(val * 128.0 + 128.0)
+    return max(0, min(255, result))
 
 async def control_loop():
     print(f"Scanning for {TARGET_DEVICE_NAME}...")
@@ -44,7 +48,7 @@ async def control_loop():
         
         print(f"✓ Connected\n")
         
-        last_throttle = last_steering = None
+        last_throttle = last_steering = last_omega = None
         
         try:
             while True:
@@ -52,6 +56,7 @@ async def control_loop():
                 
                 throttle = to_byte(inp.get_bipolar_ctrl('w', 's', 'LY') * THROTTLE_SCALE)
                 steering = to_byte(inp.get_bipolar_ctrl('d', 'a', 'RX') * STEERING_SCALE)
+                omega = to_byte(inp.get_bipolar_ctrl('e', 'q', 'RY'))  # Q/E keys or right stick Y
                 
                 if throttle != last_throttle:
                     await client.write_gatt_char(CHAR_UUID_THROTTLE, bytearray([throttle]))
@@ -60,6 +65,10 @@ async def control_loop():
                 if steering != last_steering:
                     await client.write_gatt_char(CHAR_UUID_STEERING, bytearray([steering]))
                     last_steering = steering
+                
+                if omega != last_omega:
+                    await client.write_gatt_char(CHAR_UUID_OMEGA, bytearray([omega]))
+                    last_omega = omega
                 
                 # LED: OFF when pressed, ON when released
                 led = 0 if (inp.is_pressed('x') or inp.is_pressed('A')) else 1

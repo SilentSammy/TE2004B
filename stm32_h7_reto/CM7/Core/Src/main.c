@@ -50,6 +50,7 @@ typedef struct {
 typedef struct {
     float throttle;  // Throttle value (-1.0 to +1.0)
     float steering;  // Steering value (-1.0 to +1.0)
+    float omega;     // Omega (angular velocity) value
 } MotorControl;
 
 typedef struct {
@@ -218,16 +219,13 @@ void debugLoop() {
 	}
 }
 
+
 // CAN FUNCTIONS
 static inline uint8_t dlc_to_bytes(uint32_t dlc) {
     static const uint8_t map[16] = {0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64};
     return (dlc < 16) ? map[dlc] : 0;
 }
 
-/**
- * @brief Drain FIFO and update all tracked CAN messages in latestMsgs[]
- * @return Number of messages read from FIFO (total, not unique IDs)
- */
 int drainAndUpdateCANMessages(void)
 {
     FDCAN_RxHeaderTypeDef RxHeader;
@@ -264,11 +262,6 @@ int drainAndUpdateCANMessages(void)
     return totalFramesRead;
 }
 
-/**
- * @brief Get latest CAN message for a specific ID
- * @param id CAN identifier to retrieve
- * @return Pointer to CANMessage or NULL if not found
- */
 CANMessage* getCANMessageByID(uint32_t id)
 {
     for (uint8_t i = 0; i < NUM_CAN_IDS; i++) {
@@ -412,7 +405,7 @@ bool readOrientation(Orientation* orientation, int32_t timeoutMs /* = -1 */)
 
 bool readMotorControl(MotorControl* control, int32_t timeoutMs /* = -1 */)
 {
-    static MotorControl lastControl = {0.0f, 0.0f};
+    static MotorControl lastControl = {0.0f, 0.0f, 0.0f};
 
     if (control == NULL) {
         return false;  // Invalid pointer
@@ -428,15 +421,17 @@ bool readMotorControl(MotorControl* control, int32_t timeoutMs /* = -1 */)
 
     // 2) Get the motor control message
     CANMessage* controlMsg = getCANMessageByID(0x125);
-    if (controlMsg != NULL && controlMsg->length >= 4) {
-        // Decode throttle (bytes 0-1), steering (bytes 2-3)
+    if (controlMsg != NULL && controlMsg->length >= 6) {
+        // Decode throttle (bytes 0-1), steering (bytes 2-3), omega (bytes 4-5)
         int16_t throttleRaw = (int16_t)((uint16_t)controlMsg->data[0] | ((uint16_t)controlMsg->data[1] << 8));
         int16_t steeringRaw = (int16_t)((uint16_t)controlMsg->data[2] | ((uint16_t)controlMsg->data[3] << 8));
+        int16_t omegaRaw = (int16_t)((uint16_t)controlMsg->data[4] | ((uint16_t)controlMsg->data[5] << 8));
 
         // Convert to normalized float (-1.0 to +1.0)
         lastControl.throttle = throttleRaw / 1000.0f;
         lastControl.throttle *= 2;
         lastControl.steering = steeringRaw / 1000.0f;
+        lastControl.omega = omegaRaw / 1000.0f;
     }
 
     // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
@@ -447,12 +442,14 @@ bool readMotorControl(MotorControl* control, int32_t timeoutMs /* = -1 */)
             if (newFrames > 0) {
                 // Fresh data arrived, update motor control
                 controlMsg = getCANMessageByID(0x125);
-                if (controlMsg != NULL && controlMsg->length >= 4) {
+                if (controlMsg != NULL && controlMsg->length >= 6) {
                     int16_t throttleRaw = (int16_t)((uint16_t)controlMsg->data[0] | ((uint16_t)controlMsg->data[1] << 8));
                     int16_t steeringRaw = (int16_t)((uint16_t)controlMsg->data[2] | ((uint16_t)controlMsg->data[3] << 8));
+                    int16_t omegaRaw = (int16_t)((uint16_t)controlMsg->data[4] | ((uint16_t)controlMsg->data[5] << 8));
 
                     lastControl.throttle = throttleRaw / 1000.0f;
                     lastControl.steering = steeringRaw / 1000.0f;
+                    lastControl.omega = omegaRaw / 1000.0f;
                 }
                 break;
             }
@@ -622,6 +619,111 @@ bool readPseudoGPS(PseudoGPS* gps, int32_t timeoutMs /* = -1 */)
     return (gpsMsg != NULL && gpsMsg->timestamp > 0);
 }
 
+// HELPERS
+float unwrapAngle(float wrappedAngle) {
+    static float unwrappedValue = 0.0f;
+    static bool initialized = false;
+    
+    if (!initialized) {
+        // First call - initialize with current angle
+        unwrappedValue = wrappedAngle;
+        initialized = true;
+        return unwrappedValue;
+    }
+    
+    // Calculate previous wrapped equivalent
+    float wrappedPrev = fmodf(unwrappedValue, 360.0f);
+    if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
+    
+    // Calculate delta with current reading
+    float delta = wrappedAngle - wrappedPrev;
+    
+    // Normalize delta to [-180, 180]
+    while (delta > 180.0f) delta -= 360.0f;
+    while (delta < -180.0f) delta += 360.0f;
+    
+    // Update unwrapped value
+    unwrappedValue += delta;
+    
+    return unwrappedValue;
+}
+
+void differentialToAckermann(float omega, bool reset, float* throttle, float* steering) {
+    static int32_t baseEncoderPosition = 0;
+    static bool movingForward = true;  // Current movement direction
+    const int32_t danceAmplitude = 500;  // How far to move from baseline
+    const float throttleStrength = 0.8f;  // Base throttle magnitude
+    
+    if (reset) {
+        baseEncoderPosition = readEncoder(0);
+        movingForward = true;  // Start by moving forward
+    }
+    
+    int32_t currentPosition = readEncoder(0);
+    int32_t delta = currentPosition - baseEncoderPosition;
+    
+    // Switch direction based on current position
+    if (movingForward && delta >= danceAmplitude) {
+        movingForward = false;
+    } else if (!movingForward && delta <= -danceAmplitude) {
+        movingForward = true;
+    }
+    
+    // Set throttle based on direction
+    *throttle = movingForward ? throttleStrength : -throttleStrength;
+    *steering = movingForward ? omega : -omega;
+}
+
+// Helper function to apply motor control to actuators
+void applyMotorControl(const MotorControl* control) {
+    static bool differentialInitialized = false;
+    
+    if (control == NULL) return;
+    
+    float throttle, steering;
+    
+    // Check if omega is non-zero (use differential drive mode)
+    if (control->omega != 0.0f) {
+        // Use differential to Ackermann conversion
+        differentialToAckermann(control->omega, !differentialInitialized, &throttle, &steering);
+        differentialInitialized = true;
+    } else {
+        // Use direct steering and throttle commands
+        throttle = control->throttle;
+        steering = control->steering;
+        differentialInitialized = false;  // Reset for next differential mode entry
+    }
+    
+    // Apply to actuators
+    Turning_SetAngle(steering);
+    SetEscSpeed(throttle);
+}
+
+// LOOP FUNCTIONS
+void loopSpinInPlace(void) {
+    const float omega = 0.7f;  // Spinning factor
+    bool firstCall = true;
+    
+    printf("\n\r[Spin In Place] Starting with omega=%.2f...\n\r", omega);
+    
+    while (1) {
+        float throttle, steering;
+        
+        // Call differential to Ackermann converter
+        differentialToAckermann(omega, firstCall, &throttle, &steering);
+        firstCall = false;
+        
+        // Apply to actuators
+        Turning_SetAngle(steering);
+        SetEscSpeed(throttle);
+        
+        // Drain CAN messages
+        drainAndUpdateCANMessages();
+        
+        HAL_Delay(10);
+    }
+}
+
 void loopPrintEncoder(void)
 {
     const uint32_t printIntervalMs = 100;   // print every 100 ms
@@ -782,39 +884,6 @@ void loopPrintUnwrapped(void) {
     }
 }
 
-/**
- * @brief Unwrap angle to avoid discontinuities at ±180°
- * @param wrappedAngle Current wrapped angle reading (0-360° or -180 to +180°)
- * @return Unwrapped continuous angle value
- */
-float unwrapAngle(float wrappedAngle) {
-    static float unwrappedValue = 0.0f;
-    static bool initialized = false;
-    
-    if (!initialized) {
-        // First call - initialize with current angle
-        unwrappedValue = wrappedAngle;
-        initialized = true;
-        return unwrappedValue;
-    }
-    
-    // Calculate previous wrapped equivalent
-    float wrappedPrev = fmodf(unwrappedValue, 360.0f);
-    if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
-    
-    // Calculate delta with current reading
-    float delta = wrappedAngle - wrappedPrev;
-    
-    // Normalize delta to [-180, 180]
-    while (delta > 180.0f) delta -= 360.0f;
-    while (delta < -180.0f) delta += 360.0f;
-    
-    // Update unwrapped value
-    unwrappedValue += delta;
-    
-    return unwrappedValue;
-}
-
 void loopPrintMotorControl(void) {
     const uint32_t printIntervalMs = 100;      // print every 100 ms
     const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
@@ -830,18 +899,14 @@ void loopPrintMotorControl(void) {
         // 1) Read motor control values and apply to hardware
         MotorControl control;
         if (readMotorControl(&control, 0)) {  // Non-blocking read
-            // Apply steering to servo
-            Turning_SetAngle(control.steering);
-            
-            // Apply throttle to ESC
-            SetEscSpeed(control.throttle);
+            applyMotorControl(&control);
         }
 
         // 2) Periodically print motor control values
         if (now - lastPrint >= printIntervalMs)
         {
             if (readMotorControl(&control, 0)) {
-                printf("Throttle: %+5.2f | Steering: %+5.2f\n\r", control.throttle, control.steering);
+                printf("Throttle: %+5.2f | Steering: %+5.2f | Omega: %+5.2f\n\r", control.throttle, control.steering, control.omega);
             } else {
                 printf("Motor Control: [No data]\n\r");
             }
@@ -874,8 +939,7 @@ void loopPrintAll(void) {
         // 1) Apply motor control commands
         MotorControl control;
         if (readMotorControl(&control, 0)) {
-            Turning_SetAngle(control.steering);
-            SetEscSpeed(control.throttle);
+            applyMotorControl(&control);
         }
 
         // 2) Periodically print all values
@@ -921,7 +985,7 @@ void loopPrintAll(void) {
             }
 
             if (hasControl) {
-                printf("T:%+5.2f S:%+5.2f\n\r", control.throttle, control.steering);
+                printf("T:%+5.2f S:%+5.2f W:%+5.2f\n\r", control.throttle, control.steering, control.omega);
             } else {
                 printf("Ctrl:[No data]\n\r");
             }
@@ -1442,6 +1506,7 @@ Error_Handler();
 //  waypoint2DLoop();
 //  loopPrintPseudoGPS();
 //    navigationLoop();
+//  loopSpinInPlace();
   /* USER CODE END 2 */
 
   /* Infinite loop */
