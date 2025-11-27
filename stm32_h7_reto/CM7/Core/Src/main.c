@@ -82,7 +82,18 @@ typedef struct {
     float margin;       // Half-width of square tolerance region (±margin in both x and y)
     int eventType;      // Event type: 0=LED, 1=Steering, 2=Throttle, etc.
     float eventArg;     // Event argument (e.g., LED state, steering angle, throttle value)
+} WaypointEvent;
+
+typedef struct {
+    float x;            // Target X coordinate
+    float y;            // Target Y coordinate
+    float omega;        // Target orientation in degrees
 } Waypoint2D;
+
+typedef enum {
+    MODE_MANUAL,      // Direct control via throttle/steering/omega
+    MODE_WAYPOINT     // Autonomous waypoint navigation
+} ControlMode;
 
 /* USER CODE END PTD */
 
@@ -119,6 +130,7 @@ UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+static ControlMode currentMode = MODE_MANUAL;  // Default to manual
 FDCAN_FilterTypeDef sFilterConfig;
 FDCAN_TxHeaderTypeDef TxHeader;
 FDCAN_RxHeaderTypeDef RxHeader;
@@ -132,7 +144,8 @@ CANMessage latestMsgs[] = {
     {.id = 0x125, .length = 0, .timestamp = 0, .isExtended = false},  // Motor Control
     {.id = 0x126, .length = 0, .timestamp = 0, .isExtended = false},  // Angular Velocity
 	{.id = 0x127, .length = 0, .timestamp = 0, .isExtended = false},   // Linear Acceleration
-    {.id = 0x128, .length = 0, .timestamp = 0, .isExtended = false}   // Linear Acceleration
+    {.id = 0x128, .length = 0, .timestamp = 0, .isExtended = false},   // Camera Position
+    {.id = 0x129, .length = 0, .timestamp = 0, .isExtended = false}   // Waypoint commands
 };
 #define NUM_CAN_IDS (sizeof(latestMsgs) / sizeof(latestMsgs[0]))
 /* USER CODE END PV */
@@ -461,7 +474,75 @@ bool readMotorControl(MotorControl* control, int32_t timeoutMs /* = -1 */)
     *control = lastControl;
 
     // Return true if we have valid data (timestamp > 0 means we received at least one message)
-    return (controlMsg != NULL && controlMsg->timestamp > 0);
+    if (controlMsg != NULL && controlMsg->timestamp > 0) {
+        currentMode = MODE_MANUAL;
+        return true;
+    }
+    return false;
+}
+
+bool readWaypoint2D(Waypoint2D* waypoint, int32_t timeoutMs)
+{
+    static Waypoint2D lastWaypoint = {0.0f, 0.0f, 0.0f};
+
+    if (waypoint == NULL) {
+        return false;  // Invalid pointer
+    }
+
+    if (timeoutMs == -1)
+        timeoutMs = 200;  // Default wait time
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+
+    // 1) Drain FIFO and update all tracked messages
+    int framesRead = drainAndUpdateCANMessages();
+
+    // 2) Get the waypoint message
+    CANMessage* waypointMsg = getCANMessageByID(0x129);
+    if (waypointMsg != NULL && waypointMsg->length >= 6) {
+        // Decode x (bytes 0-1), y (bytes 2-3), omega (bytes 4-5) - little-endian
+        int16_t x_mm = (int16_t)((uint16_t)waypointMsg->data[0] | ((uint16_t)waypointMsg->data[1] << 8));
+        int16_t y_mm = (int16_t)((uint16_t)waypointMsg->data[2] | ((uint16_t)waypointMsg->data[3] << 8));
+        int16_t omega_dec = (int16_t)((uint16_t)waypointMsg->data[4] | ((uint16_t)waypointMsg->data[5] << 8));
+
+        // Convert to float (mm → cm, decidegrees → degrees)
+        lastWaypoint.x = x_mm / 10.0f;
+        lastWaypoint.y = y_mm / 10.0f;
+        lastWaypoint.omega = omega_dec / 10.0f;
+    }
+
+    // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                // Fresh data arrived, update waypoint
+                waypointMsg = getCANMessageByID(0x129);
+                if (waypointMsg != NULL && waypointMsg->length >= 6) {
+                    int16_t x_mm = (int16_t)((uint16_t)waypointMsg->data[0] | ((uint16_t)waypointMsg->data[1] << 8));
+                    int16_t y_mm = (int16_t)((uint16_t)waypointMsg->data[2] | ((uint16_t)waypointMsg->data[3] << 8));
+                    int16_t omega_dec = (int16_t)((uint16_t)waypointMsg->data[4] | ((uint16_t)waypointMsg->data[5] << 8));
+
+                    lastWaypoint.x = x_mm / 10.0f;
+                    lastWaypoint.y = y_mm / 10.0f;
+                    lastWaypoint.omega = omega_dec / 10.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
+    // Copy to output
+    *waypoint = lastWaypoint;
+
+    // Return true if we have valid data and set mode to waypoint
+    if (waypointMsg != NULL && waypointMsg->timestamp > 0) {
+        currentMode = MODE_WAYPOINT;
+        return true;
+    }
+    return false;
 }
 
 bool readAngularVelocity(AngularVelocity* angvel, int32_t timeoutMs /* = -1 */)
@@ -942,6 +1023,12 @@ void loopPrintAll(void) {
             applyMotorControl(&control);
         }
 
+        // 1b) Read waypoint commands (just reception for now)
+        Waypoint2D waypoint;
+        if (readWaypoint2D(&waypoint, 0)) {
+            // Waypoint received - TODO: implement navigation logic
+        }
+
         // 2) Periodically print all values
         if (now - lastPrint >= printIntervalMs)
         {
@@ -952,11 +1039,13 @@ void loopPrintAll(void) {
             AngularVelocity angvel;
             LinearAcceleration accel;
             PseudoGPS gps;
+            Waypoint2D waypoint;
             bool hasOrientation = readOrientation(&orient, 0);
             bool hasAngvel = readAngularVelocity(&angvel, 0);
             bool hasAccel = readLinearAcceleration(&accel, 0);
             bool hasControl = readMotorControl(&control, 0);
             bool hasGPS = readPseudoGPS(&gps, 0);
+            bool hasWaypoint = readWaypoint2D(&waypoint, 0);
 
             printf("Enc:%8ld | ", (long)encoderCount);
             
@@ -985,9 +1074,15 @@ void loopPrintAll(void) {
             }
 
             if (hasControl) {
-                printf("T:%+5.2f S:%+5.2f W:%+5.2f\n\r", control.throttle, control.steering, control.omega);
+                printf("T:%+5.2f S:%+5.2f W:%+5.2f | ", control.throttle, control.steering, control.omega);
             } else {
-                printf("Ctrl:[No data]\n\r");
+                printf("Ctrl:[No data] | ");
+            }
+
+            if (hasWaypoint) {
+                printf("WP X:%5.1f Y:%5.1f O:%5.1f\n\r", waypoint.x, waypoint.y, waypoint.omega);
+            } else {
+                printf("WP:[No data]\n\r");
             }
 
             lastPrint = now;
@@ -1230,7 +1325,7 @@ void waypoint2DLoop(void) {
     float baseThrottle = 0.8f;      // Throttle this by default
     
     // ========== WAYPOINT ARRAY ==========
-    Waypoint2D waypoints[] = {
+    WaypointEvent waypoints[] = {
         {.x = 17.0f,   .y = 113.0f, .margin = 5.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (17, 113)
         {.x = 42.0f,   .y = 113.0f, .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (42, 113)
         {.x = 69.0f,   .y = 114.0f, .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (69, 114)

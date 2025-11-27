@@ -24,6 +24,7 @@
 #define CHARACTERISTIC_UUID_THROTTLE "12345678-1234-5678-1234-56789abcdef2"
 #define CHARACTERISTIC_UUID_STEERING "12345678-1234-5678-1234-56789abcdef3"
 #define CHARACTERISTIC_UUID_OMEGA    "12345678-1234-5678-1234-56789abcdef4"
+#define CHARACTERISTIC_UUID_WAYPOINT "12345678-1234-5678-1234-56789abcdef5"
 #define DEVICE_NAME "BLE_Sensor_Hub"
 
 // CAN configuration
@@ -35,12 +36,14 @@ const unsigned long CONTROL_INTERVAL = 50;  // Control CAN at 20Hz (50ms)
 const unsigned long ANGVEL_INTERVAL = 20;   // Angular velocity CAN at 50Hz (20ms)
 const unsigned long ACCEL_INTERVAL = 20;    // Acceleration CAN at 50Hz (20ms)
 const unsigned long CAMERA_INTERVAL = 50;   // Camera data CAN at 20Hz (50ms)
+const unsigned long WAYPOINT_INTERVAL = 50; // Waypoint CAN at 20Hz (50ms)
 byte txData[8] = {0};                       // CAN message buffer (encoder)
 byte orientData[8] = {0};                   // CAN message buffer (orientation)
 byte controlData[8] = {0};                  // CAN message buffer (motor control)
 byte angvelData[8] = {0};                   // CAN message buffer (angular velocity)
 byte accelData[8] = {0};                    // CAN message buffer (linear acceleration)
 byte cameraData[8] = {0};                   // CAN message buffer (camera position)
+byte waypointData[8] = {0};                 // CAN message buffer (waypoint)
 bool canInitialized = false;
 
 // Encoder variables (functions in encoder.ino)
@@ -66,9 +69,14 @@ float currentOmega = 0.0;     // -1.0 to 1.0
 unsigned long lastControlTxTime = 0;
 bool controlChanged = false;
 
+// BLE Waypoint variables
+uint8_t waypointBuffer[6] = {0};  // x (2 bytes), y (2 bytes), omega (2 bytes)
+unsigned long lastWaypointTxTime = 0;
+bool waypointChanged = false;
+
 // BLE Callback functions
-void onLedControl(uint8_t value) {
-  if (value > 0) {
+void onLedControl(uint8_t* data, size_t len) {
+  if (data[0] > 0) {
     digitalWrite(LED_PIN, HIGH);
     if (DEBUG_BLE) Serial.println("LED: ON");
   } else {
@@ -77,8 +85,8 @@ void onLedControl(uint8_t value) {
   }
 }
 
-void onThrottleControl(uint8_t value) {
-  currentThrottle = toBipolar(value);
+void onThrottleControl(uint8_t* data, size_t len) {
+  currentThrottle = toBipolar(data[0]);
   controlChanged = true;
   if (DEBUG_BLE) {
     Serial.print("Throttle: ");
@@ -86,8 +94,8 @@ void onThrottleControl(uint8_t value) {
   }
 }
 
-void onSteeringControl(uint8_t value) {
-  currentSteering = toBipolar(value);
+void onSteeringControl(uint8_t* data, size_t len) {
+  currentSteering = toBipolar(data[0]);
   controlChanged = true;
   if (DEBUG_BLE) {
     Serial.print("Steering: ");
@@ -95,12 +103,37 @@ void onSteeringControl(uint8_t value) {
   }
 }
 
-void onOmegaControl(uint8_t value) {
-  currentOmega = toBipolar(value);
+void onOmegaControl(uint8_t* data, size_t len) {
+  currentOmega = toBipolar(data[0]);
   controlChanged = true;
   if (DEBUG_BLE) {
     Serial.print("Omega: ");
     Serial.println(currentOmega, 3);
+  }
+}
+
+void onWaypointControl(uint8_t* data, size_t len) {
+  if (len >= 6) {
+    // Copy the 6-byte waypoint data (x, y, omega as int16_t little-endian)
+    for (int i = 0; i < 6; i++) {
+      waypointBuffer[i] = data[i];
+    }
+    waypointChanged = true;
+    
+    if (DEBUG_BLE) {
+      // Optional: decode for debugging
+      int16_t x_mm = (int16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
+      int16_t y_mm = (int16_t)((uint16_t)data[2] | ((uint16_t)data[3] << 8));
+      int16_t omega_dec = (int16_t)((uint16_t)data[4] | ((uint16_t)data[5] << 8));
+      
+      Serial.print("Waypoint: X=");
+      Serial.print(x_mm / 10.0f, 1);
+      Serial.print(" cm, Y=");
+      Serial.print(y_mm / 10.0f, 1);
+      Serial.print(" cm, Omega=");
+      Serial.print(omega_dec / 10.0f, 1);
+      Serial.println(" deg");
+    }
   }
 }
 
@@ -163,6 +196,22 @@ void sendControlCAN() {
     Serial.print(currentSteering, 2);
     Serial.print(" W:");
     Serial.println(currentOmega, 2);
+  }
+}
+
+void sendWaypointCAN() {
+  // Copy waypoint buffer to CAN message (already encoded as 6 bytes)
+  for (int i = 0; i < 6; i++) {
+    waypointData[i] = waypointBuffer[i];
+  }
+  waypointData[6] = 0;
+  waypointData[7] = 0;
+  
+  // Send on CAN ID 0x129
+  byte sndStat = CAN0.sendMsgBuf(0x129, 0, 8, waypointData);
+  
+  if (DEBUG_BLE && sndStat == CAN_OK) {
+    Serial.println("CAN Waypoint TX");
   }
 }
 
@@ -273,6 +322,7 @@ void setup() {
   BLE_addCharacteristic(CHARACTERISTIC_UUID_THROTTLE, onThrottleControl);
   BLE_addCharacteristic(CHARACTERISTIC_UUID_STEERING, onSteeringControl);
   BLE_addCharacteristic(CHARACTERISTIC_UUID_OMEGA, onOmegaControl);
+  BLE_addCharacteristic(CHARACTERISTIC_UUID_WAYPOINT, onWaypointControl);
   BLE_start(DEVICE_NAME);
   
   // BLE Camera Client setup
@@ -359,6 +409,15 @@ void loop() {
     lastControlTxTime = now;
     controlChanged = false;
     sendControlCAN();
+  }
+  
+  // ========== WAYPOINT CAN TX (Event + Periodic) ==========
+  bool waypointDueByTimeout = (now - lastWaypointTxTime >= WAYPOINT_INTERVAL);
+  
+  if (waypointChanged || waypointDueByTimeout) {
+    lastWaypointTxTime = now;
+    waypointChanged = false;
+    sendWaypointCAN();
   }
   
   // ========== ENCODER CAN TX (Variable rate) ==========

@@ -17,7 +17,7 @@ static bool deviceConnected = false;
 #define MAX_CALLBACKS 10
 struct CallbackEntry {
   const char* charUUID;
-  void (*callback)(uint8_t);
+  void (*callback)(uint8_t*, size_t);
   BLECharacteristic* pChar;
 };
 static CallbackEntry callbacks[MAX_CALLBACKS];
@@ -45,12 +45,10 @@ class CharCallbacks: public BLECharacteristicCallbacks {
       size_t len = pCharacteristic->getValue().length();
       
       if (len > 0) {
-        uint8_t value = pData[0];
-        
-        // Find and call the registered callback
+        // Find and call the registered callback with full data array
         for (int i = 0; i < callbackCount; i++) {
           if (callbacks[i].pChar == pCharacteristic && callbacks[i].callback != NULL) {
-            callbacks[i].callback(value);
+            callbacks[i].callback(pData, len);
             break;
           }
         }
@@ -74,7 +72,7 @@ void BLE_init(const char* deviceName, const char* serviceUUID) {
   Serial.println("BLE server initialized");
 }
 
-void BLE_addCharacteristic(const char* charUUID, void (*callback)(uint8_t)) {
+void BLE_addCharacteristic(const char* charUUID, void (*callback)(uint8_t*, size_t)) {
   if (pService == NULL || callbackCount >= MAX_CALLBACKS) {
     Serial.println("Error: Cannot add characteristic");
     return;
