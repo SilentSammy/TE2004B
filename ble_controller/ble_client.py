@@ -4,7 +4,6 @@ BLE Keyboard/Gamepad Control - WASD or gamepad for throttle/steering, X for LED
 
 import asyncio
 from bleak import BleakScanner, BleakClient
-import combined_input as inp
 from pathlib import Path
 import time
 
@@ -84,7 +83,7 @@ class CarBLEClient:
         self._cached_char_values[char_uuid] = value_bytes
         self._cached_char_timestamps[char_uuid] = now
     
-    async def set_waypoint(self, x, y, omega):
+    async def set_waypoint(self, x, y, omega=0.0):
         """Set waypoint (x, y in cm, omega in degrees)"""
         # Encode as int16_t with ×10 scaling
         x_mm = int(x * 10)
@@ -119,6 +118,7 @@ class CarBLEClient:
         await self.set_char(self.base_uuid + "4", mapped)
 
 async def control_loop():
+    import combined_input as inp
     car = CarBLEClient()
     await car.connect()
     
@@ -153,20 +153,14 @@ async def debug_loop():
     await car.connect()
     
     try:
-        # Set a test waypoint
-        # await car.set_waypoint(50.0, 100.0, 90.0)
-        # print("Waypoint set to (50.0, 100.0, 90.0)")
-        pass
-        
-    except KeyboardInterrupt:
-        pass
+        pass # Set a breakpoint here to debug
     finally:
         await car.disconnect()
 
 if __name__ == "__main__":
     try:
-        # asyncio.run(control_loop())
-        asyncio.run(debug_loop())
+        asyncio.run(control_loop())
+        # asyncio.run(debug_loop())
     except KeyboardInterrupt:
         print("Interrupted")
     except Exception as e:
