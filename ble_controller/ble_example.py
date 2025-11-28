@@ -4,6 +4,7 @@ Example: Import and use CarBLEClient for custom control
 
 import asyncio
 from ble_client import CarBLEClient
+import time
 
 async def example_loop():
     # Create client instance
@@ -14,11 +15,11 @@ async def example_loop():
     
     try:
         while True:
-            # Example 1: Set constant values
-            await car.set_throttle(0.5)    # 50% forward
-            await car.set_steering(0.3)    # 30% right
-            await car.set_omega(0.0)       # no rotation
-            await car.set_waypoint(10.0, 20.0, 45.0)  # Set waypoint to (10, 20) with 45 degrees orientation
+            # await car.set_waypoint(45, 45)
+            await car.set_led(0)
+            time.sleep(0.5)
+            await car.set_led(1)
+            time.sleep(0.5)
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")
