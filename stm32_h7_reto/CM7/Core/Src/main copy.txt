@@ -286,20 +286,45 @@ CANMessage* getCANMessageByID(uint32_t id)
     return NULL;  // ID not tracked
 }
 
-int32_t readEncoder(void)
+int32_t readEncoder(int32_t timeoutMs /* = -1 */)
 {
     static int32_t lastPosition = 0;
 
-    // Get the encoder message from latestMsgs array
+    if (timeoutMs == -1)
+        timeoutMs = 200;  // Default wait time
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+
+    // 1) Drain FIFO and update all tracked messages
+    int framesRead = drainAndUpdateCANMessages();
+
+    // 2) Get the encoder message
     CANMessage* encoderMsg = getCANMessageByID(0x123);
     if (encoderMsg != NULL && encoderMsg->length >= 4) {
         memcpy(&lastPosition, encoderMsg->data, sizeof(lastPosition));
     }
 
+    // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                // Fresh data arrived, update encoder value
+                encoderMsg = getCANMessageByID(0x123);
+                if (encoderMsg != NULL && encoderMsg->length >= 4) {
+                    memcpy(&lastPosition, encoderMsg->data, sizeof(lastPosition));
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
     return lastPosition;
 }
 
-bool readOrientation(Orientation* orientation)
+bool readOrientation(Orientation* orientation, int32_t timeoutMs /* = -1 */)
 {
     static Orientation lastOrientation = {0.0f, 0.0f, 0.0f};
 
@@ -307,7 +332,15 @@ bool readOrientation(Orientation* orientation)
         return false;  // Invalid pointer
     }
 
-    // Get the orientation message from latestMsgs array
+    if (timeoutMs == -1)
+        timeoutMs = 200;  // Default wait time
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+
+    // 1) Drain FIFO and update all tracked messages
+    int framesRead = drainAndUpdateCANMessages();
+
+    // 2) Get the orientation message
     CANMessage* orientMsg = getCANMessageByID(0x124);
     if (orientMsg != NULL && orientMsg->length >= 6) {
         // Decode roll (bytes 0-1), pitch (bytes 2-3), yaw (bytes 4-5)
@@ -321,6 +354,29 @@ bool readOrientation(Orientation* orientation)
         lastOrientation.yaw   = yawRaw / 100.0f;
     }
 
+    // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                // Fresh data arrived, update orientation
+                orientMsg = getCANMessageByID(0x124);
+                if (orientMsg != NULL && orientMsg->length >= 6) {
+                    uint16_t rollRaw   = (uint16_t)orientMsg->data[0] | ((uint16_t)orientMsg->data[1] << 8);
+                    uint16_t pitchRaw  = (uint16_t)orientMsg->data[2] | ((uint16_t)orientMsg->data[3] << 8);
+                    uint16_t yawRaw    = (uint16_t)orientMsg->data[4] | ((uint16_t)orientMsg->data[5] << 8);
+
+                    lastOrientation.roll  = rollRaw / 100.0f;
+                    lastOrientation.pitch = pitchRaw / 100.0f;
+                    lastOrientation.yaw   = yawRaw / 100.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
     // Copy to output
     *orientation = lastOrientation;
 
@@ -328,7 +384,7 @@ bool readOrientation(Orientation* orientation)
     return (orientMsg != NULL && orientMsg->timestamp > 0);
 }
 
-bool readMotorControl(MotorControl* control)
+bool readMotorControl(MotorControl* control, int32_t timeoutMs /* = -1 */)
 {
     static MotorControl lastControl = {0.0f, 0.0f, 0.0f};
 
@@ -336,7 +392,15 @@ bool readMotorControl(MotorControl* control)
         return false;  // Invalid pointer
     }
 
-    // Get the motor control message from latestMsgs array
+    if (timeoutMs == -1)
+        timeoutMs = 200;  // Default wait time
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+
+    // 1) Drain FIFO and update all tracked messages
+    int framesRead = drainAndUpdateCANMessages();
+
+    // 2) Get the motor control message
     CANMessage* controlMsg = getCANMessageByID(0x125);
     if (controlMsg != NULL && controlMsg->length >= 6) {
         // Decode throttle (bytes 0-1), steering (bytes 2-3), omega (bytes 4-5)
@@ -351,6 +415,29 @@ bool readMotorControl(MotorControl* control)
         lastControl.omega = omegaRaw / 1000.0f;
     }
 
+    // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                // Fresh data arrived, update motor control
+                controlMsg = getCANMessageByID(0x125);
+                if (controlMsg != NULL && controlMsg->length >= 6) {
+                    int16_t throttleRaw = (int16_t)((uint16_t)controlMsg->data[0] | ((uint16_t)controlMsg->data[1] << 8));
+                    int16_t steeringRaw = (int16_t)((uint16_t)controlMsg->data[2] | ((uint16_t)controlMsg->data[3] << 8));
+                    int16_t omegaRaw = (int16_t)((uint16_t)controlMsg->data[4] | ((uint16_t)controlMsg->data[5] << 8));
+
+                    lastControl.throttle = throttleRaw / 1000.0f;
+                    lastControl.steering = steeringRaw / 1000.0f;
+                    lastControl.omega = omegaRaw / 1000.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
     // Copy to output
     *control = lastControl;
 
@@ -362,7 +449,7 @@ bool readMotorControl(MotorControl* control)
     return false;
 }
 
-bool readWaypoint2D(Waypoint2D* waypoint)
+bool readWaypoint2D(Waypoint2D* waypoint, int32_t timeoutMs)
 {
     static Waypoint2D lastWaypoint = {0.0f, 0.0f, 0.0f};
 
@@ -370,7 +457,15 @@ bool readWaypoint2D(Waypoint2D* waypoint)
         return false;  // Invalid pointer
     }
 
-    // Get the waypoint message from latestMsgs array
+    if (timeoutMs == -1)
+        timeoutMs = 200;  // Default wait time
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+
+    // 1) Drain FIFO and update all tracked messages
+    int framesRead = drainAndUpdateCANMessages();
+
+    // 2) Get the waypoint message
     CANMessage* waypointMsg = getCANMessageByID(0x129);
     if (waypointMsg != NULL && waypointMsg->length >= 6) {
         // Decode x (bytes 0-1), y (bytes 2-3), omega (bytes 4-5) - little-endian
@@ -384,6 +479,29 @@ bool readWaypoint2D(Waypoint2D* waypoint)
         lastWaypoint.omega = omega_dec / 10.0f;
     }
 
+    // 3) If FIFO was full, wait for a fresh frame to ensure data isn't stale
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                // Fresh data arrived, update waypoint
+                waypointMsg = getCANMessageByID(0x129);
+                if (waypointMsg != NULL && waypointMsg->length >= 6) {
+                    int16_t x_mm = (int16_t)((uint16_t)waypointMsg->data[0] | ((uint16_t)waypointMsg->data[1] << 8));
+                    int16_t y_mm = (int16_t)((uint16_t)waypointMsg->data[2] | ((uint16_t)waypointMsg->data[3] << 8));
+                    int16_t omega_dec = (int16_t)((uint16_t)waypointMsg->data[4] | ((uint16_t)waypointMsg->data[5] << 8));
+
+                    lastWaypoint.x = x_mm / 10.0f;
+                    lastWaypoint.y = y_mm / 10.0f;
+                    lastWaypoint.omega = omega_dec / 10.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
     // Copy to output
     *waypoint = lastWaypoint;
 
@@ -395,7 +513,7 @@ bool readWaypoint2D(Waypoint2D* waypoint)
     return false;
 }
 
-bool readAngularVelocity(AngularVelocity* angvel)
+bool readAngularVelocity(AngularVelocity* angvel, int32_t timeoutMs /* = -1 */)
 {
     static AngularVelocity lastAngvel = {0.0f, 0.0f, 0.0f};
 
@@ -403,7 +521,12 @@ bool readAngularVelocity(AngularVelocity* angvel)
         return false;
     }
 
-    // Get the angular velocity message from latestMsgs array
+    if (timeoutMs == -1)
+        timeoutMs = 200;
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+    int framesRead = drainAndUpdateCANMessages();
+
     CANMessage* angvelMsg = getCANMessageByID(0x126);
     if (angvelMsg != NULL && angvelMsg->length >= 6) {
         int16_t gx_raw = (int16_t)((uint16_t)angvelMsg->data[0] | ((uint16_t)angvelMsg->data[1] << 8));
@@ -415,11 +538,32 @@ bool readAngularVelocity(AngularVelocity* angvel)
         lastAngvel.gz = gz_raw / 10.0f;
     }
 
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                angvelMsg = getCANMessageByID(0x126);
+                if (angvelMsg != NULL && angvelMsg->length >= 6) {
+                    int16_t gx_raw = (int16_t)((uint16_t)angvelMsg->data[0] | ((uint16_t)angvelMsg->data[1] << 8));
+                    int16_t gy_raw = (int16_t)((uint16_t)angvelMsg->data[2] | ((uint16_t)angvelMsg->data[3] << 8));
+                    int16_t gz_raw = (int16_t)((uint16_t)angvelMsg->data[4] | ((uint16_t)angvelMsg->data[5] << 8));
+
+                    lastAngvel.gx = gx_raw / 10.0f;
+                    lastAngvel.gy = gy_raw / 10.0f;
+                    lastAngvel.gz = gz_raw / 10.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
     *angvel = lastAngvel;
     return (angvelMsg != NULL && angvelMsg->timestamp > 0);
 }
 
-bool readLinearAcceleration(LinearAcceleration* accel)
+bool readLinearAcceleration(LinearAcceleration* accel, int32_t timeoutMs /* = -1 */)
 {
     static LinearAcceleration lastAccel = {0.0f, 0.0f, 0.0f};
 
@@ -427,7 +571,12 @@ bool readLinearAcceleration(LinearAcceleration* accel)
         return false;
     }
 
-    // Get the linear acceleration message from latestMsgs array
+    if (timeoutMs == -1)
+        timeoutMs = 200;
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+    int framesRead = drainAndUpdateCANMessages();
+
     CANMessage* accelMsg = getCANMessageByID(0x127);
     if (accelMsg != NULL && accelMsg->length >= 6) {
         int16_t ax_raw = (int16_t)((uint16_t)accelMsg->data[0] | ((uint16_t)accelMsg->data[1] << 8));
@@ -439,11 +588,32 @@ bool readLinearAcceleration(LinearAcceleration* accel)
         lastAccel.az = az_raw / 100.0f;
     }
 
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                accelMsg = getCANMessageByID(0x127);
+                if (accelMsg != NULL && accelMsg->length >= 6) {
+                    int16_t ax_raw = (int16_t)((uint16_t)accelMsg->data[0] | ((uint16_t)accelMsg->data[1] << 8));
+                    int16_t ay_raw = (int16_t)((uint16_t)accelMsg->data[2] | ((uint16_t)accelMsg->data[3] << 8));
+                    int16_t az_raw = (int16_t)((uint16_t)accelMsg->data[4] | ((uint16_t)accelMsg->data[5] << 8));
+
+                    lastAccel.ax = ax_raw / 100.0f;
+                    lastAccel.ay = ay_raw / 100.0f;
+                    lastAccel.az = az_raw / 100.0f;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
+    }
+
     *accel = lastAccel;
     return (accelMsg != NULL && accelMsg->timestamp > 0);
 }
 
-bool readPseudoGPS(PseudoGPS* gps)
+bool readPseudoGPS(PseudoGPS* gps, int32_t timeoutMs /* = -1 */)
 {
     static PseudoGPS lastGPS = {0.0f, 0.0f, 0.0f};
 
@@ -451,7 +621,12 @@ bool readPseudoGPS(PseudoGPS* gps)
         return false;
     }
 
-    // Get the pseudo-GPS message from latestMsgs array
+    if (timeoutMs == -1)
+        timeoutMs = 200;
+
+    int fifoCapacity = hfdcan1.Init.RxFifo0ElmtsNbr;
+    int framesRead = drainAndUpdateCANMessages();
+
     CANMessage* gpsMsg = getCANMessageByID(0x128);
     if (gpsMsg != NULL && gpsMsg->length >= 8) {
         // Decode big-endian format (MSB first)
@@ -466,6 +641,27 @@ bool readPseudoGPS(PseudoGPS* gps)
         lastGPS.x = (float)x_raw;
         lastGPS.y = (float)y_raw;
         lastGPS.w = (float)w_raw;
+    }
+
+    if (framesRead >= fifoCapacity && timeoutMs > 0) {
+        uint32_t timeout = HAL_GetTick() + (uint32_t)timeoutMs;
+        while (HAL_GetTick() < timeout) {
+            int newFrames = drainAndUpdateCANMessages();
+            if (newFrames > 0) {
+                gpsMsg = getCANMessageByID(0x128);
+                if (gpsMsg != NULL && gpsMsg->length >= 8) {
+                    uint16_t x_raw = ((uint16_t)gpsMsg->data[2] << 8) | (uint16_t)gpsMsg->data[3];
+                    uint16_t y_raw = ((uint16_t)gpsMsg->data[4] << 8) | (uint16_t)gpsMsg->data[5];
+                    uint16_t w_raw = ((uint16_t)gpsMsg->data[6] << 8) | (uint16_t)gpsMsg->data[7];
+
+                    lastGPS.x = (float)x_raw;
+                    lastGPS.y = (float)y_raw;
+                    lastGPS.w = (float)w_raw;
+                }
+                break;
+            }
+            HAL_Delay(1);
+        }
     }
 
     *gps = lastGPS;
@@ -508,11 +704,11 @@ void differentialToAckermann(float omega, bool reset, float* throttle, float* st
     const float throttleStrength = 0.8f;  // Base throttle magnitude
     
     if (reset) {
-        baseEncoderPosition = readEncoder();
+        baseEncoderPosition = readEncoder(0);
         movingForward = true;  // Start by moving forward
     }
     
-    int32_t currentPosition = readEncoder();
+    int32_t currentPosition = readEncoder(0);
     int32_t delta = currentPosition - baseEncoderPosition;
     
     // Switch direction based on current position
@@ -640,6 +836,108 @@ void loopSpinInPlace(void) {
     }
 }
 
+void loopPrintEncoder(void)
+{
+    const uint32_t printIntervalMs = 100;   // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[Encoder Monitor] Starting...\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // 1) Periodically read encoder value
+        if (now - lastPrint >= printIntervalMs)
+        {
+            int32_t encoderCount = readEncoder(-1);
+            printf("Encoder: %ld\n\r", (long)encoderCount);
+            lastPrint = now;
+        }
+
+        // 2) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Encoder Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
+void loopPrintOrientation(void) {
+    const uint32_t printIntervalMs = 100;      // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[Orientation Monitor] Starting...\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // 1) Periodically read orientation values
+        if (now - lastPrint >= printIntervalMs)
+        {
+            Orientation orient;
+            if (readOrientation(&orient, -1)) {
+                printf("Roll: %6.2f° | Pitch: %6.2f° | Yaw: %6.2f°\n\r", orient.roll, orient.pitch, orient.yaw);
+            } else {
+                printf("Orientation: [No data]\n\r");
+            }
+            lastPrint = now;
+        }
+
+        // 2) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Orientation Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
+void loopPrintPseudoGPS(void) {
+    const uint32_t printIntervalMs = 100;      // print every 100 ms
+    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
+    uint32_t lastPrint = HAL_GetTick();
+    uint32_t lastHeartbeat = HAL_GetTick();
+
+    printf("\n\r[Pseudo-GPS Monitor] Starting...\n\r");
+
+    while (1)
+    {
+        uint32_t now = HAL_GetTick();
+
+        // 1) Periodically read pseudo-GPS values
+        if (now - lastPrint >= printIntervalMs)
+        {
+            PseudoGPS gps;
+            if (readPseudoGPS(&gps, -1)) {
+                printf("X: %7.1f | Y: %7.1f | Omega: %7.1f\n\r", gps.x, gps.y, gps.w);
+            } else {
+                printf("Pseudo-GPS: [No data]\n\r");
+            }
+            lastPrint = now;
+        }
+
+        // 2) Heartbeat every second
+        if (now - lastHeartbeat >= heartbeatIntervalMs)
+        {
+            printf("[Pseudo-GPS Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            lastHeartbeat = now;
+        }
+
+        HAL_Delay(1);
+    }
+}
+
 void loopPrintUnwrapped(void) {
     const uint32_t printIntervalMs = 100;
     const uint32_t heartbeatIntervalMs = 1000;
@@ -655,14 +953,13 @@ void loopPrintUnwrapped(void) {
     {
         uint32_t now = HAL_GetTick();
 
-        // Drain CAN FIFO once per loop iteration
-        drainAndUpdateCANMessages();
-
         // Periodically read and unwrap yaw
         if (now - lastPrint >= printIntervalMs)
         {
+            drainAndUpdateCANMessages();
+
             Orientation orient;
-            if (readOrientation(&orient)) {
+            if (readOrientation(&orient, 0)) {
                 if (!initialized) {
                     // First reading - initialize unwrapped value
                     unwrappedYaw = orient.yaw;
@@ -699,34 +996,39 @@ void loopPrintUnwrapped(void) {
     }
 }
 
-void loopPrintEncoder(void)
-{
-    const uint32_t printIntervalMs = 100;   // print every 100 ms
+void loopPrintMotorControl(void) {
+    const uint32_t printIntervalMs = 100;      // print every 100 ms
     const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
     uint32_t lastPrint = HAL_GetTick();
     uint32_t lastHeartbeat = HAL_GetTick();
 
-    printf("\n\r[Encoder Monitor] Starting...\n\r");
+    printf("\n\r[Motor Control Monitor] Starting...\n\r");
 
     while (1)
     {
         uint32_t now = HAL_GetTick();
 
-        // Drain CAN FIFO once per loop iteration
-        drainAndUpdateCANMessages();
+        // 1) Read motor control values and apply to hardware
+        MotorControl control;
+        if (readMotorControl(&control, 0)) {  // Non-blocking read
+            applyMotorControl(&control);
+        }
 
-        // 1) Periodically read encoder value
+        // 2) Periodically print motor control values
         if (now - lastPrint >= printIntervalMs)
         {
-            int32_t encoderCount = readEncoder();
-            printf("Encoder: %ld\n\r", (long)encoderCount);
+            if (readMotorControl(&control, 0)) {
+                printf("Throttle: %+5.2f | Steering: %+5.2f | Omega: %+5.2f\n\r", control.throttle, control.steering, control.omega);
+            } else {
+                printf("Motor Control: [No data]\n\r");
+            }
             lastPrint = now;
         }
 
-        // 2) Heartbeat every second
+        // 3) Heartbeat every second
         if (now - lastHeartbeat >= heartbeatIntervalMs)
         {
-            printf("[Encoder Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
+            printf("[Motor Control Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
             lastHeartbeat = now;
         }
 
@@ -748,13 +1050,13 @@ void loopPrintAll(void) {
 
         // 1) Apply motor control commands
         MotorControl control;
-        if (readMotorControl(&control)) {
+        if (readMotorControl(&control, 0)) {
             applyMotorControl(&control);
         }
 
         // 1b) Read waypoint commands (just reception for now)
         Waypoint2D waypoint;
-        if (readWaypoint2D(&waypoint)) {
+        if (readWaypoint2D(&waypoint, 0)) {
             // Waypoint received - TODO: implement navigation logic
         }
 
@@ -763,18 +1065,18 @@ void loopPrintAll(void) {
         {
             drainAndUpdateCANMessages();
 
-            int32_t encoderCount = readEncoder();
+            int32_t encoderCount = readEncoder(0);
             Orientation orient;
             AngularVelocity angvel;
             LinearAcceleration accel;
             PseudoGPS gps;
             Waypoint2D waypoint;
-            bool hasOrientation = readOrientation(&orient);
-            bool hasAngvel = readAngularVelocity(&angvel);
-            bool hasAccel = readLinearAcceleration(&accel);
-            bool hasControl = readMotorControl(&control);
-            bool hasGPS = readPseudoGPS(&gps);
-            bool hasWaypoint = readWaypoint2D(&waypoint);
+            bool hasOrientation = readOrientation(&orient, 0);
+            bool hasAngvel = readAngularVelocity(&angvel, 0);
+            bool hasAccel = readLinearAcceleration(&accel, 0);
+            bool hasControl = readMotorControl(&control, 0);
+            bool hasGPS = readPseudoGPS(&gps, 0);
+            bool hasWaypoint = readWaypoint2D(&waypoint, 0);
 
             printf("Enc:%8ld | ", (long)encoderCount);
             
@@ -880,7 +1182,7 @@ void loopTurnTo(void) {
 
         // Read current orientation
         Orientation orient;
-        bool hasOrientation = readOrientation(&orient);
+        bool hasOrientation = readOrientation(&orient, 0);
 
         float throttle = 0.0f;
         float error = 0.0f;
@@ -1024,7 +1326,7 @@ void waypointLoop(void) {
         
         // Drain CAN and read current encoder position
         drainAndUpdateCANMessages();
-        int32_t currentPosition = readEncoder();
+        int32_t currentPosition = readEncoder(0);
         
         // Check each waypoint
         for (uint8_t i = 0; i < numEvents; i++) {
@@ -1084,12 +1386,10 @@ void waypoint2DLoop(void) {
         float currentSteering = baseSteering;
         float currentThrottle = baseThrottle;
         
-        // Drain CAN FIFO once per loop iteration
+        // Drain CAN messages and read current position
         drainAndUpdateCANMessages();
-        
-        // Read current position
         PseudoGPS gps;
-        bool hasGPS = readPseudoGPS(&gps);
+        bool hasGPS = readPseudoGPS(&gps, 0);
         bool insideWaypoint = false;
         
         if (hasGPS) {
@@ -1158,12 +1458,10 @@ void navigationLoop(void) {
     while (1) {
         uint32_t now = HAL_GetTick();
         
-        // Drain CAN FIFO once per loop iteration
+        // Drain CAN messages and read current position and orientation
         drainAndUpdateCANMessages();
-        
-        // Read current position and orientation
         PseudoGPS gps;
-        bool hasGPS = readPseudoGPS(&gps);
+        bool hasGPS = readPseudoGPS(&gps, 0);
         
         float steering = 0.0f;
         float throttle = 0.0f;
@@ -1369,7 +1667,7 @@ Error_Handler();
   SetEscSpeed(0);
   HAL_Delay(500);
 //  loopPrintAllCAN();
- loopPrintAll();
+//  loopPrintAll();
 //  loopPrintEncoder();
 //  loopPrintOrientation();
 //  loopPrintMotorControl();
@@ -1379,7 +1677,7 @@ Error_Handler();
 //  waypointLoop();
 //  waypoint2DLoop();
 //  loopPrintPseudoGPS();
-//   navigationLoop();
+  navigationLoop();
 //  loopSpinInPlace();
   /* USER CODE END 2 */
 
