@@ -112,6 +112,8 @@ typedef enum {
 #endif
 #endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
 
+#define M_PI 3.14159265358979323846f
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -755,6 +757,36 @@ void differentialToAckermann(float omega, bool reset, float* throttle, float* st
     *steering = movingForward ? omega : -omega;
 }
 
+// Helper function to check if waypoint is reachable (within 45° cone in front or back)
+bool isWaypointReachable(float car_x, float car_y, float car_yaw, float wp_x, float wp_y) {
+    // Calculate vector from car to waypoint
+    float dx = wp_x - car_x;
+    float dy = wp_y - car_y;
+    
+    // Calculate angle to waypoint in degrees
+    float angle_to_waypoint = atan2f(dy, dx) * 180.0f / M_PI;
+    
+    // Normalize to 0-360 range
+    while (angle_to_waypoint < 0) angle_to_waypoint += 360.0f;
+    while (angle_to_waypoint >= 360.0f) angle_to_waypoint -= 360.0f;
+    
+    // Normalize car yaw to 0-360 range
+    float car_yaw_norm = car_yaw;
+    while (car_yaw_norm < 0) car_yaw_norm += 360.0f;
+    while (car_yaw_norm >= 360.0f) car_yaw_norm -= 360.0f;
+    
+    // Calculate relative angle (-180 to +180)
+    float relative_angle = angle_to_waypoint - car_yaw_norm;
+    while (relative_angle > 180.0f) relative_angle -= 360.0f;
+    while (relative_angle < -180.0f) relative_angle += 360.0f;
+    
+    // Check if within ±22.5° (front cone) or ±22.5° from 180° (back cone)
+    bool front_reachable = (relative_angle >= -22.5f && relative_angle <= 22.5f);
+    bool back_reachable = (relative_angle >= 157.5f || relative_angle <= -157.5f);
+    
+    return front_reachable || back_reachable;
+}
+
 // Helper function to apply motor control to actuators
 void applyMotorControl(const MotorControl* control) {
     static bool differentialInitialized = false;
@@ -1227,7 +1259,7 @@ void loopTurnTo(void) {
 void waypointLoop(void) {
     // ========== CONFIGURABLE CONSTANTS ==========
     const uint32_t countsPerMeter = 16066;        // Encoder counts per meter of travel
-//    const float turnDiameter = 1.14f;             // Turn diameter in meters (at steering = 0.6)
+    // const float turnDiameter = 1.14f;             // Turn diameter in meters (at steering = 0.6)
     const float turnDiameter = 0.97f;			// Turn diameter in meters (at steering = 0.7)
     const float turnSteering = 0.7f;              // Steering value for the turn
     const float segLength = 0.5f;                 // Length of straight segments (meters)
@@ -1436,6 +1468,7 @@ void navigationLoop(void) {
         float throttle = 0.0f;
         float angleError = 0.0f;
         float distance = 0.0f;
+        bool reachable = false;
         
         if (hasGPS) {
             // Get unwrapped heading angle
@@ -1446,6 +1479,9 @@ void navigationLoop(void) {
             float dy = targetY - gps.y;
             distance = sqrtf(dx * dx + dy * dy);
             float targetAngle = atan2f(dy, dx) * 180.0f / 3.14159265f;  // Convert to degrees
+            
+            // Check if waypoint is reachable
+            reachable = isWaypointReachable(gps.x, gps.y, gps.w, targetX, targetY);
             
             // Calculate angle error (difference between car's heading and target angle)
             angleError = targetAngle - unwrappedHeading;
@@ -1482,10 +1518,49 @@ void navigationLoop(void) {
             
             // Throttle control based on distance and reverse state
             if (distance > waypointRadius) {
-                if (shouldReverse) {
-                    throttle = -movingThrottle;  // Reverse
+                if (reachable) {
+                    // Waypoint is reachable, navigate towards it
+                    if (shouldReverse) {
+                        throttle = -movingThrottle;  // Reverse
+                    } else {
+                        throttle = movingThrottle;   // Forward
+                    }
                 } else {
-                    throttle = movingThrottle;   // Forward
+                    // Waypoint is unreachable - spin in place to align
+                    // Calculate rotation needed to point front at waypoint
+                    float frontAngle = targetAngle - gps.w;
+                    while (frontAngle > 180.0f) frontAngle -= 360.0f;
+                    while (frontAngle < -180.0f) frontAngle += 360.0f;
+                    
+                    // Calculate rotation needed to point back at waypoint (add 180°)
+                    float backAngle = frontAngle + 180.0f;
+                    if (backAngle > 180.0f) backAngle -= 360.0f;
+                    if (backAngle < -180.0f) backAngle += 360.0f;
+                    
+                    // Choose the smaller rotation (front or back alignment)
+                    float relativeAngle;
+                    if (fabsf(frontAngle) <= fabsf(backAngle)) {
+                        relativeAngle = frontAngle;  // Align front to waypoint
+                    } else {
+                        relativeAngle = backAngle;   // Align back to waypoint
+                    }
+                    
+                    // Use differential drive to spin
+                    // Positive relativeAngle = waypoint is CCW, use negative omega (inverted)
+                    // Negative relativeAngle = waypoint is CW, use positive omega (inverted)
+                    float omega = (relativeAngle > 0.0f) ? -0.7f : 0.7f;
+                    
+                    static bool spinInitialized = false;
+                    static bool wasReachable = true;  // Track previous reachability state
+                    
+                    // Reset differential drive when waypoint becomes unreachable
+                    if (wasReachable && !reachable) {
+                        spinInitialized = false;
+                    }
+                    
+                    differentialToAckermann(omega, !spinInitialized, &throttle, &steering);
+                    spinInitialized = true;
+                    wasReachable = reachable;
                 }
             } else {
                 throttle = 0.0f;  // Stop at waypoint
@@ -1496,6 +1571,9 @@ void navigationLoop(void) {
         // Update actuators
         Turning_SetAngle(steering);
         SetEscSpeed(throttle);
+        
+        // LED: ON when unreachable, OFF when reachable
+        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, (!reachable) ? GPIO_PIN_SET : GPIO_PIN_RESET);
         
         // Periodic debug print
         if (now - lastPrint >= printIntervalMs) {
@@ -1590,7 +1668,7 @@ Error_Handler();
   SetEscSpeed(0);
   HAL_Delay(500);
 //  loopPrintAllCAN();
-  loopPrintAll();
+//  loopPrintAll();
 //  loopPrintEncoder();
 //  loopPrintOrientation();
 //  loopPrintMotorControl();
@@ -1600,7 +1678,7 @@ Error_Handler();
 //  waypointLoop();
 //  waypoint2DLoop();
 //  loopPrintPseudoGPS();
-//    navigationLoop();
+  navigationLoop();
 //  loopSpinInPlace();
   /* USER CODE END 2 */
 

@@ -128,7 +128,7 @@ async def control_loop():
             
             throttle = inp.get_bipolar_ctrl('w', 's', 'LY') * THROTTLE_SCALE
             steering = inp.get_bipolar_ctrl('d', 'a', 'RX') * STEERING_SCALE
-            omega = inp.get_bipolar_ctrl('e', 'q', 'RY')  # Q/E keys or right stick Y
+            omega = inp.get_bipolar_ctrl('e', 'q', 'DPAD_RIGHT', 'DPAD_LEFT')  # Q/E keys or right stick Y
             
             await car.set_throttle(throttle)
             await car.set_steering(steering)
