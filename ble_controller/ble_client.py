@@ -159,8 +159,8 @@ async def debug_loop():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(control_loop())
-        # asyncio.run(debug_loop())
+        # asyncio.run(control_loop())
+        asyncio.run(debug_loop())
     except KeyboardInterrupt:
         print("Interrupted")
     except Exception as e:

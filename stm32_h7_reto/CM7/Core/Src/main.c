@@ -112,8 +112,6 @@ typedef enum {
 #endif
 #endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
 
-#define M_PI 3.14159265358979323846f
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -223,7 +221,7 @@ void StopCarEsc(void)
 {
     SetEscSpeed(0.0f);   // Neutral = 1500 µs pulse
 }
-void debugLoop() {
+void ActuatorDebugLoop() {
 	float dbg_spd = 0.5f;
 	float dbg_str = 0.0f;
 
@@ -473,32 +471,28 @@ bool readPseudoGPS(PseudoGPS* gps)
 }
 
 // HELPERS
-float unwrapAngle(float wrappedAngle) {
-    static float unwrappedValue = 0.0f;
-    static bool initialized = false;
+void applyMotorControl(const MotorControl* control) {
+    static bool differentialInitialized = false;
     
-    if (!initialized) {
-        // First call - initialize with current angle
-        unwrappedValue = wrappedAngle;
-        initialized = true;
-        return unwrappedValue;
+    if (control == NULL) return;
+    
+    float throttle, steering;
+    
+    // Check if omega is non-zero (use differential drive mode)
+    if (control->omega != 0.0f) {
+        // Use differential to Ackermann conversion
+        differentialToAckermann(control->omega, !differentialInitialized, &throttle, &steering);
+        differentialInitialized = true;
+    } else {
+        // Use direct steering and throttle commands
+        throttle = control->throttle;
+        steering = control->steering;
+        differentialInitialized = false;  // Reset for next differential mode entry
     }
     
-    // Calculate previous wrapped equivalent
-    float wrappedPrev = fmodf(unwrappedValue, 360.0f);
-    if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
-    
-    // Calculate delta with current reading
-    float delta = wrappedAngle - wrappedPrev;
-    
-    // Normalize delta to [-180, 180]
-    while (delta > 180.0f) delta -= 360.0f;
-    while (delta < -180.0f) delta += 360.0f;
-    
-    // Update unwrapped value
-    unwrappedValue += delta;
-    
-    return unwrappedValue;
+    // Apply to actuators
+    Turning_SetAngle(steering);
+    SetEscSpeed(throttle);
 }
 
 void differentialToAckermann(float omega, bool reset, float* throttle, float* steering) {
@@ -527,7 +521,34 @@ void differentialToAckermann(float omega, bool reset, float* throttle, float* st
     *steering = movingForward ? omega : -omega;
 }
 
-// Helper function to check if waypoint is reachable (within 45° cone in front or back)
+float unwrapAngle(float wrappedAngle) {
+    static float unwrappedValue = 0.0f;
+    static bool initialized = false;
+    
+    if (!initialized) {
+        // First call - initialize with current angle
+        unwrappedValue = wrappedAngle;
+        initialized = true;
+        return unwrappedValue;
+    }
+    
+    // Calculate previous wrapped equivalent
+    float wrappedPrev = fmodf(unwrappedValue, 360.0f);
+    if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
+    
+    // Calculate delta with current reading
+    float delta = wrappedAngle - wrappedPrev;
+    
+    // Normalize delta to [-180, 180]
+    while (delta > 180.0f) delta -= 360.0f;
+    while (delta < -180.0f) delta += 360.0f;
+    
+    // Update unwrapped value
+    unwrappedValue += delta;
+    
+    return unwrappedValue;
+}
+
 bool isWaypointReachable(float car_x, float car_y, float car_yaw, float wp_x, float wp_y) {
     // Calculate vector from car to waypoint
     float dx = wp_x - car_x;
@@ -557,29 +578,107 @@ bool isWaypointReachable(float car_x, float car_y, float car_yaw, float wp_x, fl
     return front_reachable || back_reachable;
 }
 
-// Helper function to apply motor control to actuators
-void applyMotorControl(const MotorControl* control) {
-    static bool differentialInitialized = false;
+MotorControl computeWaypointControl(const PseudoGPS* gps, const Waypoint2D* waypoint) {
+    // Default: stopped
+    MotorControl control = {0.0f, 0.0f, 0.0f};
     
-    if (control == NULL) return;
+    // Control parameters
+    const float Kp = 0.05f;
+    const float maxSteering = 0.85f;
+    const float waypointRadius = 5.0f;
+    const float movingThrottle = 0.8f;
     
-    float throttle, steering;
-    
-    // Check if omega is non-zero (use differential drive mode)
-    if (control->omega != 0.0f) {
-        // Use differential to Ackermann conversion
-        differentialToAckermann(control->omega, !differentialInitialized, &throttle, &steering);
-        differentialInitialized = true;
-    } else {
-        // Use direct steering and throttle commands
-        throttle = control->throttle;
-        steering = control->steering;
-        differentialInitialized = false;  // Reset for next differential mode entry
+    // Validate inputs
+    if (gps == NULL || waypoint == NULL) {
+        return control;
     }
     
-    // Apply to actuators
-    Turning_SetAngle(steering);
-    SetEscSpeed(throttle);
+    // Get unwrapped heading angle
+    float unwrappedHeading = unwrapAngle(gps->w);
+    
+    // Calculate distance and angle to target waypoint
+    float dx = waypoint->x - gps->x;
+    float dy = waypoint->y - gps->y;
+    float distance = sqrtf(dx * dx + dy * dy);
+    float targetAngle = atan2f(dy, dx) * 180.0f / M_PI;
+    
+    // Check if waypoint is reachable
+    bool reachable = isWaypointReachable(gps->x, gps->y, gps->w, waypoint->x, waypoint->y);
+    
+    // Calculate angle error (difference between car's heading and target angle)
+    float angleError = targetAngle - unwrappedHeading;
+    
+    // Normalize angle error to [-180, 180]
+    while (angleError > 180.0f) angleError -= 360.0f;
+    while (angleError < -180.0f) angleError += 360.0f;
+    
+    // If we're within the waypoint radius, stop
+    if (distance <= waypointRadius) {
+        return control;  // Already at {0, 0, 0}
+    }
+    
+    if (reachable) {
+        // Waypoint is reachable - navigate towards it
+        
+        // Determine if we need to reverse
+        bool shouldReverse = fabsf(angleError) > 90.0f;
+        
+        // When reversing, flip the angle error by 180° to point backwards
+        if (shouldReverse) {
+            if (angleError > 0.0f) {
+                angleError -= 180.0f;
+            } else {
+                angleError += 180.0f;
+            }
+        }
+        
+        // Apply proportional control and invert direction
+        control.steering = -Kp * angleError;
+        
+        // If reversing, invert steering (car steers opposite direction in reverse)
+        if (shouldReverse) {
+            control.steering = -control.steering;
+        }
+        
+        // Clamp steering
+        if (control.steering > maxSteering) control.steering = maxSteering;
+        if (control.steering < -maxSteering) control.steering = -maxSteering;
+        
+        // Set throttle
+        if (shouldReverse) {
+            control.throttle = -movingThrottle;  // Reverse
+        } else {
+            control.throttle = movingThrottle;   // Forward
+        }
+        
+    } else {
+        // Waypoint is unreachable - spin in place to align
+        
+        // Calculate rotation needed to point front at waypoint
+        float frontAngle = targetAngle - gps->w;
+        while (frontAngle > 180.0f) frontAngle -= 360.0f;
+        while (frontAngle < -180.0f) frontAngle += 360.0f;
+        
+        // Calculate rotation needed to point back at waypoint (add 180°)
+        float backAngle = frontAngle + 180.0f;
+        if (backAngle > 180.0f) backAngle -= 360.0f;
+        if (backAngle < -180.0f) backAngle += 360.0f;
+        
+        // Choose the smaller rotation (front or back alignment)
+        float relativeAngle;
+        if (fabsf(frontAngle) <= fabsf(backAngle)) {
+            relativeAngle = frontAngle;  // Align front to waypoint
+        } else {
+            relativeAngle = backAngle;   // Align back to waypoint
+        }
+        
+        // Use differential drive to spin
+        // Positive relativeAngle = waypoint is CCW, use negative omega (inverted)
+        // Negative relativeAngle = waypoint is CW, use positive omega (inverted)
+        control.omega = (relativeAngle > 0.0f) ? -0.7f : 0.7f;
+    }
+    
+    return control;
 }
 
 // LOOP FUNCTIONS
@@ -640,100 +739,6 @@ void loopSpinInPlace(void) {
     }
 }
 
-void loopPrintUnwrapped(void) {
-    const uint32_t printIntervalMs = 100;
-    const uint32_t heartbeatIntervalMs = 1000;
-    uint32_t lastPrint = HAL_GetTick();
-    uint32_t lastHeartbeat = HAL_GetTick();
-
-    float unwrappedYaw = 0.0f;
-    bool initialized = false;
-
-    printf("\n\r[Unwrapped Yaw Monitor] Starting...\n\r");
-
-    while (1)
-    {
-        uint32_t now = HAL_GetTick();
-
-        // Drain CAN FIFO once per loop iteration
-        drainAndUpdateCANMessages();
-
-        // Periodically read and unwrap yaw
-        if (now - lastPrint >= printIntervalMs)
-        {
-            Orientation orient;
-            if (readOrientation(&orient)) {
-                if (!initialized) {
-                    // First reading - initialize unwrapped value
-                    unwrappedYaw = orient.yaw;
-                    initialized = true;
-                } else {
-                    // Unwrap algorithm
-                    float wrappedPrev = fmodf(unwrappedYaw, 360.0f);
-                    if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
-                    
-                    float delta = orient.yaw - wrappedPrev;
-                    
-                    // Normalize delta to [-180, 180]
-                    while (delta > 180.0f) delta -= 360.0f;
-                    while (delta < -180.0f) delta += 360.0f;
-                    
-                    unwrappedYaw += delta;
-                }
-                
-                printf("Wrapped: %6.2f° | Unwrapped: %8.2f°\n\r", orient.yaw, unwrappedYaw);
-            } else {
-                printf("Orientation: [No data]\n\r");
-            }
-            lastPrint = now;
-        }
-
-        // Heartbeat every second
-        if (now - lastHeartbeat >= heartbeatIntervalMs)
-        {
-            printf("[Unwrapped Yaw Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
-            lastHeartbeat = now;
-        }
-
-        HAL_Delay(1);
-    }
-}
-
-void loopPrintEncoder(void)
-{
-    const uint32_t printIntervalMs = 100;   // print every 100 ms
-    const uint32_t heartbeatIntervalMs = 1000; // heartbeat every 1 s
-    uint32_t lastPrint = HAL_GetTick();
-    uint32_t lastHeartbeat = HAL_GetTick();
-
-    printf("\n\r[Encoder Monitor] Starting...\n\r");
-
-    while (1)
-    {
-        uint32_t now = HAL_GetTick();
-
-        // Drain CAN FIFO once per loop iteration
-        drainAndUpdateCANMessages();
-
-        // 1) Periodically read encoder value
-        if (now - lastPrint >= printIntervalMs)
-        {
-            int32_t encoderCount = readEncoder();
-            printf("Encoder: %ld\n\r", (long)encoderCount);
-            lastPrint = now;
-        }
-
-        // 2) Heartbeat every second
-        if (now - lastHeartbeat >= heartbeatIntervalMs)
-        {
-            printf("[Encoder Monitor] Alive (%lu ms)\n\r", (unsigned long)now);
-            lastHeartbeat = now;
-        }
-
-        HAL_Delay(1);
-    }
-}
-
 void loopPrintAll(void) {
     const uint32_t printIntervalMs = 100;
     const uint32_t heartbeatIntervalMs = 1000;
@@ -745,6 +750,9 @@ void loopPrintAll(void) {
     while (1)
     {
         uint32_t now = HAL_GetTick();
+
+        // Drain CAN FIFO once per loop iteration
+        drainAndUpdateCANMessages();
 
         // 1) Apply motor control commands
         MotorControl control;
@@ -761,20 +769,15 @@ void loopPrintAll(void) {
         // 2) Periodically print all values
         if (now - lastPrint >= printIntervalMs)
         {
-            drainAndUpdateCANMessages();
-
             int32_t encoderCount = readEncoder();
             Orientation orient;
             AngularVelocity angvel;
             LinearAcceleration accel;
             PseudoGPS gps;
-            Waypoint2D waypoint;
             bool hasOrientation = readOrientation(&orient);
             bool hasAngvel = readAngularVelocity(&angvel);
             bool hasAccel = readLinearAcceleration(&accel);
-            bool hasControl = readMotorControl(&control);
             bool hasGPS = readPseudoGPS(&gps);
-            bool hasWaypoint = readWaypoint2D(&waypoint);
 
             printf("Enc:%8ld | ", (long)encoderCount);
             
@@ -802,17 +805,8 @@ void loopPrintAll(void) {
                 printf("GPS:[No data] | ");
             }
 
-            if (hasControl) {
-                printf("T:%+5.2f S:%+5.2f W:%+5.2f | ", control.throttle, control.steering, control.omega);
-            } else {
-                printf("Ctrl:[No data] | ");
-            }
-
-            if (hasWaypoint) {
-                printf("WP X:%5.1f Y:%5.1f O:%5.1f\n\r", waypoint.x, waypoint.y, waypoint.omega);
-            } else {
-                printf("WP:[No data]\n\r");
-            }
+            printf("T:%+5.2f S:%+5.2f W:%+5.2f | ", control.throttle, control.steering, control.omega);
+            printf("WP X:%5.1f Y:%5.1f O:%5.1f\n\r", waypoint.x, waypoint.y, waypoint.omega);
 
             lastPrint = now;
         }
@@ -828,332 +822,11 @@ void loopPrintAll(void) {
     }
 }
 
-// Waypoint callback functions
-void ledOn(void) {
-    HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_SET);
-    printf("LED ON at waypoint\n\r");
-}
-
-void ledOff(void) {
-    HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
-    printf("LED OFF at waypoint\n\r");
-}
-
-void setSteering(void) {
-    Turning_SetAngle(0.7f);
-    printf("Steering set to 0.7 at waypoint\n\r");
-}
-
-void unsetSteering(void) {
-    Turning_SetAngle(0.0f);
-    printf("Steering reset to 0.0 at waypoint\n\r");
-}
-
-void loopTurnTo(void) {
-    const float relativeTurnAngle = -45.0f;  // Turn 45° from starting position
-    const float fixedSteering = 0.75f;      // Fixed turn radius
-    const float Kp = 0.05f;                 // Proportional gain
-    const float maxThrottle = 1.0f;         // Maximum throttle
-    const float minThrottle = 0.5f;         // Minimum throttle to overcome friction
-    
-    const uint32_t printIntervalMs = 100;
-    const uint32_t heartbeatIntervalMs = 1000;
-    uint32_t lastPrint = HAL_GetTick();
-    uint32_t lastHeartbeat = HAL_GetTick();
-
-    float unwrappedYaw = 0.0f;
-    float targetYaw = 0.0f;
-    bool initialized = false;
-
-    printf("\n\r[Turn To Angle] Relative Target: +%.2f°, Steering: %.2f\n\r", relativeTurnAngle, fixedSteering);
-
-    // Set fixed steering angle (invert if turning positive direction)
-    float adjustedSteering = (relativeTurnAngle > 0.0f) ? -fixedSteering : fixedSteering;
-    Turning_SetAngle(adjustedSteering);
-
-    while (1)
-    {
-        uint32_t now = HAL_GetTick();
-
-        // Drain CAN messages
-        drainAndUpdateCANMessages();
-
-        // Read current orientation
-        Orientation orient;
-        bool hasOrientation = readOrientation(&orient);
-
-        float throttle = 0.0f;
-        float error = 0.0f;
-
-        if (hasOrientation) {
-            if (!initialized) {
-                // First reading - establish baseline and target
-                unwrappedYaw = orient.yaw;
-                targetYaw = unwrappedYaw + relativeTurnAngle;
-                initialized = true;
-                printf("Initial yaw: %.2f° | Target: %.2f° (unwrapped)\n\r", unwrappedYaw, targetYaw);
-            } else {
-                // Unwrap current yaw
-                float wrappedPrev = fmodf(unwrappedYaw, 360.0f);
-                if (wrappedPrev < 0.0f) wrappedPrev += 360.0f;
-                
-                float delta = orient.yaw - wrappedPrev;
-                
-                // Normalize delta to [-180, 180]
-                while (delta > 180.0f) delta -= 360.0f;
-                while (delta < -180.0f) delta += 360.0f;
-                
-                unwrappedYaw += delta;
-            }
-
-            // Calculate error in unwrapped space (no normalization needed!)
-            error = unwrappedYaw - targetYaw;
-            
-            // P controller
-            throttle = Kp * error;
-
-            // Apply minimum throttle when error is significant
-            if (fabsf(error) > 1.0f) {  // Dead band of 1 degree
-                if (throttle > 0.0f && throttle < minThrottle) throttle = minThrottle;
-                if (throttle < 0.0f && throttle > -minThrottle) throttle = -minThrottle;
-            } else {
-                throttle = 0.0f;  // Stop when close enough
-            }
-
-            // Clamp throttle
-            if (throttle > maxThrottle) throttle = maxThrottle;
-            if (throttle < -maxThrottle) throttle = -maxThrottle;
-
-            // Apply throttle
-            SetEscSpeed(throttle);
-        }
-
-        // Periodically print status
-        if (now - lastPrint >= printIntervalMs)
-        {
-            if (hasOrientation && initialized) {
-                printf("Wrapped: %6.2f° | Unwrapped: %8.2f° | Error: %+6.2f° | Throttle: %+5.3f\n\r", 
-                       orient.yaw, unwrappedYaw, error, throttle);
-            } else if (hasOrientation) {
-                printf("Initializing...\n\r");
-            } else {
-                printf("Orientation: [No data]\n\r");
-            }
-            lastPrint = now;
-        }
-
-        // Heartbeat every second
-        if (now - lastHeartbeat >= heartbeatIntervalMs)
-        {
-            printf("[Turn To Angle] Alive (%lu ms)\n\r", (unsigned long)now);
-            lastHeartbeat = now;
-        }
-
-        HAL_Delay(1);
-    }
-}
-
-void waypointLoop(void) {
-    // ========== CONFIGURABLE CONSTANTS ==========
-    const uint32_t countsPerMeter = 16066;        // Encoder counts per meter of travel
-    // const float turnDiameter = 1.14f;             // Turn diameter in meters (at steering = 0.6)
-    const float turnDiameter = 0.97f;			// Turn diameter in meters (at steering = 0.7)
-    const float turnSteering = 0.7f;              // Steering value for the turn
-    const float segLength = 0.5f;                 // Length of straight segments (meters)
-    const float ledBlinkDuration = 0.05f;         // LED on duration (meters)
-    
-    // ========== CALCULATED TRAJECTORY PARAMETERS ==========
-    const float turnRadius = turnDiameter / 2.0f;                    // r = 0.57 m
-    const float arcLength = 3.14159265f * turnRadius;                // s = π × r ≈ 1.79 m
-    
-    // Key positions along trajectory (in meters)
-    const float pos_seg1_mid = segLength / 2.0f;                     // Midpoint of first straight
-    const float pos_arc_start = segLength;                           // Arc begins
-    const float pos_arc_mid = segLength + (arcLength / 2.0f);        // Arc midpoint
-    const float pos_arc_end = segLength + arcLength;                 // Arc ends
-    const float pos_seg2_mid = pos_arc_end + (segLength / 2.0f);     // Midpoint of second straight
-    const float pos_total = pos_arc_end + segLength;                 // Total trajectory length
-    
-    // ========== WAYPOINT EVENT ARRAY ==========
-    EncoderEvent events[] = {
-        // First straight segment - LED blink at midpoint
-        {.waypoint = pos_seg1_mid * countsPerMeter,                           .callback = ledOn},
-        {.waypoint = (pos_seg1_mid + ledBlinkDuration) * countsPerMeter,      .callback = ledOff},
-        
-        // Arc segment - Enable steering and LED events at start/mid/end
-        {.waypoint = pos_arc_start * countsPerMeter,                          .callback = setSteering},
-        {.waypoint = pos_arc_start * countsPerMeter,                          .callback = ledOn},
-        {.waypoint = (pos_arc_start + ledBlinkDuration) * countsPerMeter,     .callback = ledOff},
-        
-        {.waypoint = pos_arc_mid * countsPerMeter,                            .callback = ledOn},
-        {.waypoint = (pos_arc_mid + ledBlinkDuration) * countsPerMeter,       .callback = ledOff},
-        
-        {.waypoint = pos_arc_end * countsPerMeter,                            .callback = ledOn},
-        {.waypoint = (pos_arc_end + ledBlinkDuration) * countsPerMeter,       .callback = ledOff},
-        {.waypoint = pos_arc_end * countsPerMeter,                            .callback = unsetSteering},
-        
-        // Second straight segment - LED blink at midpoint
-        {.waypoint = pos_seg2_mid * countsPerMeter,                           .callback = ledOn},
-        {.waypoint = (pos_seg2_mid + ledBlinkDuration) * countsPerMeter,      .callback = ledOff},
-        
-        // Stop at end of trajectory and turn LED on
-        {.waypoint = pos_total * countsPerMeter,                              .callback = StopCarEsc},
-        // {.waypoint = pos_total * countsPerMeter,                              .callback = ledOn},
-    };
-    const uint8_t numEvents = sizeof(events) / sizeof(events[0]);
-    
-    // Track which events have been triggered
-    bool triggered[numEvents];
-    for (uint8_t i = 0; i < numEvents; i++) {
-        triggered[i] = false;
-    }
-    
-    const uint32_t printIntervalMs = 100;
-    uint32_t lastPrint = HAL_GetTick();
-    
-    printf("\n\r[Waypoint Loop] Starting with %u waypoints...\n\r", numEvents);
-    for (uint8_t i = 0; i < numEvents; i++) {
-        printf("  Waypoint %u: encoder = %ld\n\r", i, (long)events[i].waypoint);
-    }
-    
-    SetEscSpeed(1.0f);  // Start moving forward
-
-    while (1)
-    {
-        uint32_t now = HAL_GetTick();
-        
-        // Drain CAN and read current encoder position
-        drainAndUpdateCANMessages();
-        int32_t currentPosition = readEncoder();
-        
-        // Check each waypoint
-        for (uint8_t i = 0; i < numEvents; i++) {
-            if (!triggered[i] && currentPosition >= events[i].waypoint) {
-                // Trigger the callback
-                if (events[i].callback != NULL) {
-                    events[i].callback();
-                }
-                triggered[i] = true;
-            }
-        }
-        
-        // Periodically print encoder position
-        if (now - lastPrint >= printIntervalMs) {
-            printf("Encoder: %ld\n\r", (long)currentPosition);
-            lastPrint = now;
-        }
-        
-        HAL_Delay(1);
-    }
-}
-
-void waypoint2DLoop(void) {
-    // ========== BASE ACTUATOR STATES ==========
-    float baseLedState = 0.0f;      // LED this by default
-    float baseSteering = 0.0f;      // Steering this by default
-    float baseThrottle = 0.8f;      // Throttle this by default
-    
-    // ========== WAYPOINT ARRAY ==========
-    WaypointEvent waypoints[] = {
-        {.x = 17.0f,   .y = 113.0f, .margin = 5.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (17, 113)
-        {.x = 42.0f,   .y = 113.0f, .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (42, 113)
-        {.x = 69.0f,   .y = 114.0f, .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (69, 114)
-        {.x = 126.0f,  .y = 62.0f,  .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (126, 62)
-        {.x = 130.5f,  .y = 62.0f,  .margin = 61.5f, .eventType = 1, .eventArg = 0.7f},  // STEERING at (130.5, 62)
-        {.x = 76.0f,   .y = 7.0f,   .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (76, 7)
-        {.x = 46.0f,   .y = 7.0f,   .margin = 8.0f, .eventType = 0, .eventArg = 1.0f},  // LED ON at (46, 7)
-        {.x = 8.0f,    .y = 5.0f,   .margin = 8.0f, .eventType = 2, .eventArg = 0.0f}   // STOP at (8, 5)
-    };
-    const uint8_t numWaypoints = sizeof(waypoints) / sizeof(waypoints[0]);
-    
-    const uint32_t printIntervalMs = 1000;
-    uint32_t lastPrint = HAL_GetTick();
-    
-    printf("\n\r[Waypoint2D Loop] Starting with %u waypoints...\n\r", numWaypoints);
-    for (uint8_t i = 0; i < numWaypoints; i++) {
-        printf("  Waypoint %u: pos=(%.1f, %.1f), margin=%.1f, type=%d, arg=%.2f\n\r", 
-               i, waypoints[i].x, waypoints[i].y, waypoints[i].margin, 
-               waypoints[i].eventType, waypoints[i].eventArg);
-    }
-    
-    while (1) {
-        uint32_t now = HAL_GetTick();
-        
-        // Initialize actuator values with base states
-        float currentLed = baseLedState;
-        float currentSteering = baseSteering;
-        float currentThrottle = baseThrottle;
-        
-        // Drain CAN FIFO once per loop iteration
-        drainAndUpdateCANMessages();
-        
-        // Read current position
-        PseudoGPS gps;
-        bool hasGPS = readPseudoGPS(&gps);
-        bool insideWaypoint = false;
-        
-        if (hasGPS) {
-            // Loop through all waypoints and check if any are satisfied
-            for (uint8_t i = 0; i < numWaypoints; i++) {
-                // Check if current position is within waypoint region
-                float dx = fabsf(gps.x - waypoints[i].x);
-                float dy = fabsf(gps.y - waypoints[i].y);
-                
-                if (dx <= waypoints[i].margin && dy <= waypoints[i].margin) {
-                    // Position is inside waypoint region - apply event
-                    insideWaypoint = true;
-                    switch (waypoints[i].eventType) {
-                        case 0:  // LED event
-                            currentLed = waypoints[i].eventArg;
-                            break;
-                        case 1:  // Steering event
-                            currentSteering = waypoints[i].eventArg;
-                            break;
-                        case 2:  // Throttle event
-                            currentThrottle = waypoints[i].eventArg;
-                            break;
-                    }
-                }
-            }
-        }
-        
-        // Update all actuator states
-        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, (currentLed > 0.5f) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-        Turning_SetAngle(currentSteering);
-        SetEscSpeed(currentThrottle);
-        
-        // Periodic debug print
-        if (now - lastPrint >= printIntervalMs) {
-            if (hasGPS) {
-                printf("Pos: (%.1f, %.1f) | LED:%.1f Str:%.2f Thr:%.2f | WP:%s\n\r",
-                       gps.x, gps.y, currentLed, currentSteering, currentThrottle,
-                       insideWaypoint ? "ACTIVE" : "---");
-            } else {
-                printf("GPS: [No data] | LED:%.1f Str:%.2f Thr:%.2f\n\r",
-                       currentLed, currentSteering, currentThrottle);
-            }
-            lastPrint = now;
-        }
-        
-        HAL_Delay(10);  // 100 Hz update rate
-    }
-}
-
 void navigationLoop(void) {
-    // Target waypoint for navigation
-    const float targetX = 90.0f;
-    const float targetY = 60.0f;
-    
-    // Control parameters
-    const float Kp = 0.05f;  // Proportional gain for steering control (doubled)
-    const float maxSteering = 0.85f;  // Maximum steering limit
-    const float waypointRadius = 5.0f;  // Stop within 5 units of target
-    const float movingThrottle = 0.8f;
-    
     const uint32_t printIntervalMs = 1000;
     uint32_t lastPrint = HAL_GetTick();
     
-    printf("\n\r[Navigation Loop] Starting navigation to (%.1f, %.1f)...\n\r", targetX, targetY);
+    printf("\n\r[Navigation Loop] Waiting for waypoint commands...\n\r");
     
     while (1) {
         uint32_t now = HAL_GetTick();
@@ -1161,128 +834,38 @@ void navigationLoop(void) {
         // Drain CAN FIFO once per loop iteration
         drainAndUpdateCANMessages();
         
-        // Read current position and orientation
+        // Read current position and target waypoint
         PseudoGPS gps;
+        Waypoint2D target;
         bool hasGPS = readPseudoGPS(&gps);
+        bool hasWaypoint = readWaypoint2D(&target);
         
-        float steering = 0.0f;
-        float throttle = 0.0f;
-        float angleError = 0.0f;
-        float distance = 0.0f;
-        bool reachable = false;
-        
-        if (hasGPS) {
-            // Get unwrapped heading angle
-            float unwrappedHeading = unwrapAngle(gps.w);
-            
-            // Calculate distance and angle to target waypoint
-            float dx = targetX - gps.x;
-            float dy = targetY - gps.y;
-            distance = sqrtf(dx * dx + dy * dy);
-            float targetAngle = atan2f(dy, dx) * 180.0f / 3.14159265f;  // Convert to degrees
-            
-            // Check if waypoint is reachable
-            reachable = isWaypointReachable(gps.x, gps.y, gps.w, targetX, targetY);
-            
-            // Calculate angle error (difference between car's heading and target angle)
-            angleError = targetAngle - unwrappedHeading;
-            
-            // Normalize angle error to [-180, 180]
-            while (angleError > 180.0f) angleError -= 360.0f;
-            while (angleError < -180.0f) angleError += 360.0f;
-            
-            // Determine if we need to reverse
-            bool shouldReverse = fabsf(angleError) > 90.0f;
-            
-            // When reversing, flip the angle error by 180° to point backwards
-            if (shouldReverse) {
-                // Add/subtract 180° to flip the target direction
-                if (angleError > 0.0f) {
-                    angleError -= 180.0f;
-                } else {
-                    angleError += 180.0f;
-                }
-            }
-            
-            // Apply proportional control and invert direction
-            // Negative sign inverts: positive error now means turn left (negative steering)
-            steering = -Kp * angleError;
-            
-            // If reversing, invert steering (car steers opposite direction in reverse)
-            if (shouldReverse) {
-                steering = -steering;
-            }
-            
-            // Clamp steering to [-0.8, 0.8]
-            if (steering > maxSteering) steering = maxSteering;
-            if (steering < -maxSteering) steering = -maxSteering;
-            
-            // Throttle control based on distance and reverse state
-            if (distance > waypointRadius) {
-                if (reachable) {
-                    // Waypoint is reachable, navigate towards it
-                    if (shouldReverse) {
-                        throttle = -movingThrottle;  // Reverse
-                    } else {
-                        throttle = movingThrottle;   // Forward
-                    }
-                } else {
-                    // Waypoint is unreachable - spin in place to align
-                    // Calculate rotation needed to point front at waypoint
-                    float frontAngle = targetAngle - gps.w;
-                    while (frontAngle > 180.0f) frontAngle -= 360.0f;
-                    while (frontAngle < -180.0f) frontAngle += 360.0f;
-                    
-                    // Calculate rotation needed to point back at waypoint (add 180°)
-                    float backAngle = frontAngle + 180.0f;
-                    if (backAngle > 180.0f) backAngle -= 360.0f;
-                    if (backAngle < -180.0f) backAngle += 360.0f;
-                    
-                    // Choose the smaller rotation (front or back alignment)
-                    float relativeAngle;
-                    if (fabsf(frontAngle) <= fabsf(backAngle)) {
-                        relativeAngle = frontAngle;  // Align front to waypoint
-                    } else {
-                        relativeAngle = backAngle;   // Align back to waypoint
-                    }
-                    
-                    // Use differential drive to spin
-                    // Positive relativeAngle = waypoint is CCW, use negative omega (inverted)
-                    // Negative relativeAngle = waypoint is CW, use positive omega (inverted)
-                    float omega = (relativeAngle > 0.0f) ? -0.7f : 0.7f;
-                    
-                    static bool spinInitialized = false;
-                    static bool wasReachable = true;  // Track previous reachability state
-                    
-                    // Reset differential drive when waypoint becomes unreachable
-                    if (wasReachable && !reachable) {
-                        spinInitialized = false;
-                    }
-                    
-                    differentialToAckermann(omega, !spinInitialized, &throttle, &steering);
-                    spinInitialized = true;
-                    wasReachable = reachable;
-                }
-            } else {
-                throttle = 0.0f;  // Stop at waypoint
-                steering = 0.0f;  // Also stop steering at waypoint
-            }
+        // Compute navigation control
+        MotorControl control = {0.0f, 0.0f, 0.0f};
+        if (hasGPS && hasWaypoint) {
+            control = computeWaypointControl(&gps, &target);
         }
         
-        // Update actuators
-        Turning_SetAngle(steering);
-        SetEscSpeed(throttle);
+        // Apply motor control (handles both direct and differential drive modes)
+        applyMotorControl(&control);
         
-        // LED: ON when unreachable, OFF when reachable
-        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, (!reachable) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        // LED: ON when using omega (unreachable), OFF otherwise
+        bool spinning = (control.omega != 0.0f);
+        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, spinning ? GPIO_PIN_SET : GPIO_PIN_RESET);
         
         // Periodic debug print
         if (now - lastPrint >= printIntervalMs) {
-            if (hasGPS) {
-                printf("Pos: (%.1f, %.1f) Heading: %.1f° | Target: (%.1f, %.1f) | Dist: %.1f | Error: %+.1f° | Str: %+.3f | Thr: %.2f\n\r",
-                       gps.x, gps.y, gps.w, targetX, targetY, distance, angleError, steering, throttle);
-            } else {
+            if (hasGPS && hasWaypoint) {
+                float dx = target.x - gps.x;
+                float dy = target.y - gps.y;
+                float distance = sqrtf(dx * dx + dy * dy);
+                
+                printf("Pos: (%.1f, %.1f) Heading: %.1f° | Target: (%.1f, %.1f) | Dist: %.1f | Thr: %+.2f Str: %+.3f Omg: %+.2f\n\r",
+                       gps.x, gps.y, gps.w, target.x, target.y, distance, control.throttle, control.steering, control.omega);
+            } else if (!hasGPS) {
                 printf("GPS: [No data]\n\r");
+            } else if (!hasWaypoint) {
+                printf("Waypoint: [No data]\n\r");
             }
             lastPrint = now;
         }
@@ -1369,17 +952,13 @@ Error_Handler();
   SetEscSpeed(0);
   HAL_Delay(500);
 //  loopPrintAllCAN();
- loopPrintAll();
-//  loopPrintEncoder();
-//  loopPrintOrientation();
-//  loopPrintMotorControl();
-//  loopTurnTo();
-//  debugLoop();
+//  loopPrintAll();
+//  actuatorDebugLoop();
 //  loopPrintUnwrapped();
 //  waypointLoop();
 //  waypoint2DLoop();
 //  loopPrintPseudoGPS();
-//   navigationLoop();
+  navigationLoop();
 //  loopSpinInPlace();
   /* USER CODE END 2 */
 
