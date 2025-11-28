@@ -221,16 +221,30 @@ void StopCarEsc(void)
 {
     SetEscSpeed(0.0f);   // Neutral = 1500 µs pulse
 }
-void ActuatorDebugLoop() {
-	float dbg_spd = 0.5f;
-	float dbg_str = 0.0f;
-
-	while (1) {
-		SetEscSpeed(dbg_spd);
-		Turning_SetAngle(dbg_str);
-		StopCarEsc();
-	}
+void applyMotorControl(const MotorControl* control) {
+    static bool differentialInitialized = false;
+    
+    if (control == NULL) return;
+    
+    float throttle, steering;
+    
+    // Check if omega is non-zero (use differential drive mode)
+    if (control->omega != 0.0f) {
+        // Use differential to Ackermann conversion
+        differentialToAckermann(control->omega, !differentialInitialized, &throttle, &steering);
+        differentialInitialized = true;
+    } else {
+        // Use direct steering and throttle commands
+        throttle = control->throttle;
+        steering = control->steering;
+        differentialInitialized = false;  // Reset for next differential mode entry
+    }
+    
+    // Apply to actuators
+    Turning_SetAngle(steering);
+    SetEscSpeed(throttle);
 }
+
 
 // CAN FUNCTIONS
 static inline uint8_t dlc_to_bytes(uint32_t dlc) {
@@ -471,56 +485,6 @@ bool readPseudoGPS(PseudoGPS* gps)
 }
 
 // HELPERS
-void applyMotorControl(const MotorControl* control) {
-    static bool differentialInitialized = false;
-    
-    if (control == NULL) return;
-    
-    float throttle, steering;
-    
-    // Check if omega is non-zero (use differential drive mode)
-    if (control->omega != 0.0f) {
-        // Use differential to Ackermann conversion
-        differentialToAckermann(control->omega, !differentialInitialized, &throttle, &steering);
-        differentialInitialized = true;
-    } else {
-        // Use direct steering and throttle commands
-        throttle = control->throttle;
-        steering = control->steering;
-        differentialInitialized = false;  // Reset for next differential mode entry
-    }
-    
-    // Apply to actuators
-    Turning_SetAngle(steering);
-    SetEscSpeed(throttle);
-}
-
-void differentialToAckermann(float omega, bool reset, float* throttle, float* steering) {
-    static int32_t baseEncoderPosition = 0;
-    static bool movingForward = true;  // Current movement direction
-    const int32_t danceAmplitude = 500;  // How far to move from baseline
-    const float throttleStrength = 0.8f;  // Base throttle magnitude
-    
-    if (reset) {
-        baseEncoderPosition = readEncoder();
-        movingForward = true;  // Start by moving forward
-    }
-    
-    int32_t currentPosition = readEncoder();
-    int32_t delta = currentPosition - baseEncoderPosition;
-    
-    // Switch direction based on current position
-    if (movingForward && delta >= danceAmplitude) {
-        movingForward = false;
-    } else if (!movingForward && delta <= -danceAmplitude) {
-        movingForward = true;
-    }
-    
-    // Set throttle based on direction
-    *throttle = movingForward ? throttleStrength : -throttleStrength;
-    *steering = movingForward ? omega : -omega;
-}
-
 float unwrapAngle(float wrappedAngle) {
     static float unwrappedValue = 0.0f;
     static bool initialized = false;
@@ -681,7 +645,44 @@ MotorControl computeWaypointControl(const PseudoGPS* gps, const Waypoint2D* wayp
     return control;
 }
 
+void differentialToAckermann(float omega, bool reset, float* throttle, float* steering) {
+    static int32_t baseEncoderPosition = 0;
+    static bool movingForward = true;  // Current movement direction
+    const int32_t danceAmplitude = 500;  // How far to move from baseline
+    const float throttleStrength = 0.8f;  // Base throttle magnitude
+    
+    // Round omega to 2 decimal places to avoid floating point precision issues
+    omega = roundf(omega * 100.0f) / 100.0f;
+    
+    if (reset) {
+        baseEncoderPosition = readEncoder();
+        movingForward = true;  // Start by moving forward
+    }
+    
+    int32_t currentPosition = readEncoder();
+    int32_t delta = currentPosition - baseEncoderPosition;
+    
+    // Switch direction based on current position
+    if (movingForward && delta >= danceAmplitude) {
+        movingForward = false;
+    } else if (!movingForward && delta <= -danceAmplitude) {
+        movingForward = true;
+    }
+    
+    // Set throttle based on direction
+    *throttle = movingForward ? throttleStrength : -throttleStrength;
+    *steering = movingForward ? omega : -omega;
+}
+
 // LOOP FUNCTIONS
+void ActuatorDebugLoop() {
+	MotorControl dbg_control = {0.0f, 0.0f, 0.0f};  // {throttle, steering, omega}
+
+	while (1) {
+		applyMotorControl(&dbg_control);
+	}
+}
+
 void loopPrintAllCAN(void)
 {
     FDCAN_RxHeaderTypeDef RxHeader;
@@ -826,7 +827,10 @@ void navigationLoop(void) {
     const uint32_t printIntervalMs = 1000;
     uint32_t lastPrint = HAL_GetTick();
     
-    printf("\n\r[Navigation Loop] Waiting for waypoint commands...\n\r");
+    // Default waypoint: center position (90, 60)
+    Waypoint2D target = {90.0f, 60.0f, 0.0f};
+    
+    printf("\n\r[Navigation Loop] Starting with default waypoint (90, 60)...\n\r");
     
     while (1) {
         uint32_t now = HAL_GetTick();
@@ -834,15 +838,19 @@ void navigationLoop(void) {
         // Drain CAN FIFO once per loop iteration
         drainAndUpdateCANMessages();
         
-        // Read current position and target waypoint
+        // Read current position
         PseudoGPS gps;
-        Waypoint2D target;
         bool hasGPS = readPseudoGPS(&gps);
-        bool hasWaypoint = readWaypoint2D(&target);
+        
+        // Check for external waypoint commands (overrides default)
+        Waypoint2D externalWaypoint;
+        if (readWaypoint2D(&externalWaypoint)) {
+            target = externalWaypoint;  // Override with external waypoint
+        }
         
         // Compute navigation control
         MotorControl control = {0.0f, 0.0f, 0.0f};
-        if (hasGPS && hasWaypoint) {
+        if (hasGPS) {
             control = computeWaypointControl(&gps, &target);
         }
         
@@ -855,17 +863,15 @@ void navigationLoop(void) {
         
         // Periodic debug print
         if (now - lastPrint >= printIntervalMs) {
-            if (hasGPS && hasWaypoint) {
+            if (hasGPS) {
                 float dx = target.x - gps.x;
                 float dy = target.y - gps.y;
                 float distance = sqrtf(dx * dx + dy * dy);
                 
                 printf("Pos: (%.1f, %.1f) Heading: %.1f° | Target: (%.1f, %.1f) | Dist: %.1f | Thr: %+.2f Str: %+.3f Omg: %+.2f\n\r",
                        gps.x, gps.y, gps.w, target.x, target.y, distance, control.throttle, control.steering, control.omega);
-            } else if (!hasGPS) {
+            } else {
                 printf("GPS: [No data]\n\r");
-            } else if (!hasWaypoint) {
-                printf("Waypoint: [No data]\n\r");
             }
             lastPrint = now;
         }
@@ -952,13 +958,13 @@ Error_Handler();
   SetEscSpeed(0);
   HAL_Delay(500);
 //  loopPrintAllCAN();
-//  loopPrintAll();
-//  actuatorDebugLoop();
+  loopPrintAll();
+//  ActuatorDebugLoop();
 //  loopPrintUnwrapped();
 //  waypointLoop();
 //  waypoint2DLoop();
 //  loopPrintPseudoGPS();
-  navigationLoop();
+//  navigationLoop();
 //  loopSpinInPlace();
   /* USER CODE END 2 */
 

@@ -12,9 +12,9 @@ def load_scales():
         config_path = Path(__file__).parent / "scales.txt"
         with open(config_path) as f:
             lines = f.read().strip().split('\n')
-            return float(lines[0]), float(lines[1])
+            return float(lines[0]), float(lines[1]), float(lines[2])
     except:
-        return 1.0, 0.65
+        return 1.0, 0.8, 0.8
 
 def to_byte(val):
     # Convert -1.0 to +1.0 range to 0-255 byte
@@ -124,11 +124,11 @@ async def control_loop():
     
     try:
         while True:
-            THROTTLE_SCALE, STEERING_SCALE = load_scales()
+            THROTTLE_SCALE, STEERING_SCALE, OMEGA_SCALE = load_scales()
             
             throttle = inp.get_bipolar_ctrl('w', 's', 'LY') * THROTTLE_SCALE
             steering = inp.get_bipolar_ctrl('d', 'a', 'RX') * STEERING_SCALE
-            omega = inp.get_bipolar_ctrl('e', 'q', 'DPAD_RIGHT', 'DPAD_LEFT')  # Q/E keys or right stick Y
+            omega = inp.get_bipolar_ctrl('e', 'q', 'DPAD_RIGHT', 'DPAD_LEFT') * OMEGA_SCALE  # Q/E keys or right stick Y
             
             await car.set_throttle(throttle)
             await car.set_steering(steering)
@@ -159,8 +159,8 @@ async def debug_loop():
 
 if __name__ == "__main__":
     try:
-        # asyncio.run(control_loop())
-        asyncio.run(debug_loop())
+        asyncio.run(control_loop())
+        # asyncio.run(debug_loop())
     except KeyboardInterrupt:
         print("Interrupted")
     except Exception as e:

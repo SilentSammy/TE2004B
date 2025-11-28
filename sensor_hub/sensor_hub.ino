@@ -26,7 +26,6 @@
 #define CHARACTERISTIC_UUID_OMEGA    "12345678-1234-5678-1234-56789abcdef4"
 #define CHARACTERISTIC_UUID_WAYPOINT "12345678-1234-5678-1234-56789abcdef5"
 #define DEVICE_NAME "BLE_Sensor_Hub"
-
 // CAN configuration
 MCP_CAN CAN0(CAN0_CS);                      // CAN object
 const unsigned long TX_INTERVAL_MAX = 250;  // Always send every 250 ms
