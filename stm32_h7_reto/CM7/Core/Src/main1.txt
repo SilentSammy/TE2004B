@@ -42,16 +42,47 @@ typedef struct {
 } CANMessage;
 
 typedef struct {
+    float roll;    // Roll angle in degrees (0.00° to 360.00°)
+    float pitch;   // Pitch angle in degrees (0.00° to 360.00°)
+    float yaw;     // Yaw angle in degrees (0.00° to 360.00°)
+} Orientation;
+
+typedef struct {
     float throttle;  // Throttle value (-1.0 to +1.0)
     float steering;  // Steering value (-1.0 to +1.0)
     float omega;     // Omega (angular velocity) value
 } MotorControl;
 
 typedef struct {
+    float gx;  // Angular velocity around X-axis (°/s)
+    float gy;  // Angular velocity around Y-axis (°/s)
+    float gz;  // Angular velocity around Z-axis (°/s)
+} AngularVelocity;
+
+typedef struct {
+    float ax;  // Linear acceleration along X-axis (m/s²)
+    float ay;  // Linear acceleration along Y-axis (m/s²)
+    float az;  // Linear acceleration along Z-axis (m/s²)
+} LinearAcceleration;
+
+typedef struct {
     float x;     // X position in meters
     float y;     // Y position in meters
     float w; // Angle (omega) in degrees
 } PseudoGPS;
+
+typedef struct {
+    int32_t waypoint;  // Encoder count at which to trigger the event
+    void (*callback)(void); // Function pointer to execute when waypoint is reached
+} EncoderEvent;
+
+typedef struct {
+    float x;            // Target X coordinate
+    float y;            // Target Y coordinate
+    float margin;       // Half-width of square tolerance region (±margin in both x and y)
+    int eventType;      // Event type: 0=LED, 1=Steering, 2=Throttle, etc.
+    float eventArg;     // Event argument (e.g., LED state, steering angle, throttle value)
+} WaypointEvent;
 
 typedef struct {
     float x;            // Target X coordinate
@@ -113,8 +144,8 @@ CANMessage latestMsgs[] = {
     {.id = 0x125, .length = 0, .timestamp = 0, .isExtended = false},  // Motor Control
     {.id = 0x126, .length = 0, .timestamp = 0, .isExtended = false},  // Angular Velocity
 	{.id = 0x127, .length = 0, .timestamp = 0, .isExtended = false},   // Linear Acceleration
-    {.id = 0x128, .length = 0, .timestamp = 0, .isExtended = false},   // Pseudo-GPS
-    {.id = 0x129, .length = 0, .timestamp = 0, .isExtended = false}   // Waypoint2D
+    {.id = 0x128, .length = 0, .timestamp = 0, .isExtended = false},   // Camera Position
+    {.id = 0x129, .length = 0, .timestamp = 0, .isExtended = false}   // Waypoint commands
 };
 #define NUM_CAN_IDS (sizeof(latestMsgs) / sizeof(latestMsgs[0]))
 /* USER CODE END PV */
@@ -156,7 +187,6 @@ void Turning_SetAngle(float steer)
     /* 4) Write compare register */
     __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
 }
-
 void SetEscSpeed(float value)
 {
     /* 1) Clamp input range */
@@ -187,22 +217,34 @@ void SetEscSpeed(float value)
     /* 6) Apply PWM */
     __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, (uint32_t)ticks);
 }
-
 void StopCarEsc(void)
 {
     SetEscSpeed(0.0f);   // Neutral = 1500 µs pulse
 }
-
-void debugLoop() {
-	float dbg_spd = 0.5f;
-	float dbg_str = 0.0f;
-
-	while (1) {
-		SetEscSpeed(dbg_spd);
-		Turning_SetAngle(dbg_str);
-		StopCarEsc();
-	}
+void applyMotorControl(const MotorControl* control) {
+    static bool differentialInitialized = false;
+    
+    if (control == NULL) return;
+    
+    float throttle, steering;
+    
+    // Check if omega is non-zero (use differential drive mode)
+    if (control->omega != 0.0f) {
+        // Use differential to Ackermann conversion
+        differentialToAckermann(control->omega, !differentialInitialized, &throttle, &steering);
+        differentialInitialized = true;
+    } else {
+        // Use direct steering and throttle commands
+        throttle = control->throttle;
+        steering = control->steering;
+        differentialInitialized = false;  // Reset for next differential mode entry
+    }
+    
+    // Apply to actuators
+    Turning_SetAngle(steering);
+    SetEscSpeed(throttle);
 }
+
 
 // CAN FUNCTIONS
 static inline uint8_t dlc_to_bytes(uint32_t dlc) {
@@ -269,10 +311,38 @@ int32_t readEncoder(void)
     return lastPosition;
 }
 
+bool readOrientation(Orientation* orientation)
+{
+    static Orientation lastOrientation = {0.0f, 0.0f, 0.0f};
+
+    if (orientation == NULL) {
+        return false;  // Invalid pointer
+    }
+
+    // Get the orientation message from latestMsgs array
+    CANMessage* orientMsg = getCANMessageByID(0x124);
+    if (orientMsg != NULL && orientMsg->length >= 6) {
+        // Decode roll (bytes 0-1), pitch (bytes 2-3), yaw (bytes 4-5)
+        uint16_t rollRaw   = (uint16_t)orientMsg->data[0] | ((uint16_t)orientMsg->data[1] << 8);
+        uint16_t pitchRaw  = (uint16_t)orientMsg->data[2] | ((uint16_t)orientMsg->data[3] << 8);
+        uint16_t yawRaw    = (uint16_t)orientMsg->data[4] | ((uint16_t)orientMsg->data[5] << 8);
+
+        // Convert to degrees (0.01° resolution)
+        lastOrientation.roll  = rollRaw / 100.0f;
+        lastOrientation.pitch = pitchRaw / 100.0f;
+        lastOrientation.yaw   = yawRaw / 100.0f;
+    }
+
+    // Copy to output
+    *orientation = lastOrientation;
+
+    // Return true if we have valid data (timestamp > 0 means we received at least one message)
+    return (orientMsg != NULL && orientMsg->timestamp > 0);
+}
+
 bool readMotorControl(MotorControl* control)
 {
     static MotorControl lastControl = {0.0f, 0.0f, 0.0f};
-    static MotorControl previousControl = {0.0f, 0.0f, 0.0f};
 
     if (control == NULL) {
         return false;  // Invalid pointer
@@ -291,27 +361,22 @@ bool readMotorControl(MotorControl* control)
         lastControl.throttle *= 2;
         lastControl.steering = steeringRaw / 1000.0f;
         lastControl.omega = omegaRaw / 1000.0f;
-        
-        // Check if control values changed - switch to MANUAL mode if so
-        if (lastControl.throttle != previousControl.throttle ||
-            lastControl.steering != previousControl.steering ||
-            lastControl.omega != previousControl.omega) {
-            currentMode = MODE_MANUAL;
-            previousControl = lastControl;
-        }
     }
 
     // Copy to output
     *control = lastControl;
 
     // Return true if we have valid data (timestamp > 0 means we received at least one message)
-    return (controlMsg != NULL && controlMsg->timestamp > 0);
+    if (controlMsg != NULL && controlMsg->timestamp > 0) {
+        currentMode = MODE_MANUAL;
+        return true;
+    }
+    return false;
 }
 
 bool readWaypoint2D(Waypoint2D* waypoint)
 {
     static Waypoint2D lastWaypoint = {0.0f, 0.0f, 0.0f};
-    static Waypoint2D previousWaypoint = {0.0f, 0.0f, 0.0f};
 
     if (waypoint == NULL) {
         return false;  // Invalid pointer
@@ -329,21 +394,65 @@ bool readWaypoint2D(Waypoint2D* waypoint)
         lastWaypoint.x = x_mm / 10.0f;
         lastWaypoint.y = y_mm / 10.0f;
         lastWaypoint.omega = omega_dec / 10.0f;
-        
-        // Check if waypoint values changed - switch to WAYPOINT mode if so
-        if (lastWaypoint.x != previousWaypoint.x ||
-            lastWaypoint.y != previousWaypoint.y ||
-            lastWaypoint.omega != previousWaypoint.omega) {
-            currentMode = MODE_WAYPOINT;
-            previousWaypoint = lastWaypoint;
-        }
     }
 
     // Copy to output
     *waypoint = lastWaypoint;
 
-    // Return true if we have valid data
-    return (waypointMsg != NULL && waypointMsg->timestamp > 0);
+    // Return true if we have valid data and set mode to waypoint
+    if (waypointMsg != NULL && waypointMsg->timestamp > 0) {
+        currentMode = MODE_WAYPOINT;
+        return true;
+    }
+    return false;
+}
+
+bool readAngularVelocity(AngularVelocity* angvel)
+{
+    static AngularVelocity lastAngvel = {0.0f, 0.0f, 0.0f};
+
+    if (angvel == NULL) {
+        return false;
+    }
+
+    // Get the angular velocity message from latestMsgs array
+    CANMessage* angvelMsg = getCANMessageByID(0x126);
+    if (angvelMsg != NULL && angvelMsg->length >= 6) {
+        int16_t gx_raw = (int16_t)((uint16_t)angvelMsg->data[0] | ((uint16_t)angvelMsg->data[1] << 8));
+        int16_t gy_raw = (int16_t)((uint16_t)angvelMsg->data[2] | ((uint16_t)angvelMsg->data[3] << 8));
+        int16_t gz_raw = (int16_t)((uint16_t)angvelMsg->data[4] | ((uint16_t)angvelMsg->data[5] << 8));
+
+        lastAngvel.gx = gx_raw / 10.0f;
+        lastAngvel.gy = gy_raw / 10.0f;
+        lastAngvel.gz = gz_raw / 10.0f;
+    }
+
+    *angvel = lastAngvel;
+    return (angvelMsg != NULL && angvelMsg->timestamp > 0);
+}
+
+bool readLinearAcceleration(LinearAcceleration* accel)
+{
+    static LinearAcceleration lastAccel = {0.0f, 0.0f, 0.0f};
+
+    if (accel == NULL) {
+        return false;
+    }
+
+    // Get the linear acceleration message from latestMsgs array
+    CANMessage* accelMsg = getCANMessageByID(0x127);
+    if (accelMsg != NULL && accelMsg->length >= 6) {
+        int16_t ax_raw = (int16_t)((uint16_t)accelMsg->data[0] | ((uint16_t)accelMsg->data[1] << 8));
+        int16_t ay_raw = (int16_t)((uint16_t)accelMsg->data[2] | ((uint16_t)accelMsg->data[3] << 8));
+        int16_t az_raw = (int16_t)((uint16_t)accelMsg->data[4] | ((uint16_t)accelMsg->data[5] << 8));
+
+        lastAccel.ax = ax_raw / 100.0f;
+        lastAccel.ay = ay_raw / 100.0f;
+        lastAccel.az = az_raw / 100.0f;
+    }
+
+    *accel = lastAccel;
+    return (accelMsg != NULL && accelMsg->timestamp > 0);
 }
 
 bool readPseudoGPS(PseudoGPS* gps)
@@ -402,56 +511,6 @@ float unwrapAngle(float wrappedAngle) {
     unwrappedValue += delta;
     
     return unwrappedValue;
-}
-
-void differentialToAckermann(float omega, bool reset, float* throttle, float* steering) {
-    static int32_t baseEncoderPosition = 0;
-    static bool movingForward = true;  // Current movement direction
-    const int32_t danceAmplitude = 500;  // How far to move from baseline
-    const float throttleStrength = 0.8f;  // Base throttle magnitude
-    
-    int32_t currentPosition = readEncoder();
-    if (reset) {
-        baseEncoderPosition = currentPosition;
-        movingForward = true;  // Start by moving forward
-    }
-    
-    int32_t delta = currentPosition - baseEncoderPosition;
-    
-    // Switch direction based on current position
-    if (movingForward && delta >= danceAmplitude) {
-        movingForward = false;
-    } else if (!movingForward && delta <= -danceAmplitude) {
-        movingForward = true;
-    }
-    
-    // Set throttle based on direction
-    *throttle = movingForward ? throttleStrength : -throttleStrength;
-    *steering = movingForward ? omega : -omega;
-}
-
-void applyMotorControl(const MotorControl* control) {
-    static bool differentialInitialized = false;
-    
-    if (control == NULL) return;
-    
-    float throttle, steering;
-    
-    // Check if omega is non-zero (use differential drive mode)
-    if (control->omega != 0.0f) {
-        // Use differential to Ackermann conversion
-        differentialToAckermann(control->omega, !differentialInitialized, &throttle, &steering);
-        differentialInitialized = true;
-    } else {
-        // Use direct steering and throttle commands
-        throttle = control->throttle;
-        steering = control->steering;
-        differentialInitialized = false;  // Reset for next differential mode entry
-    }
-    
-    // Apply to actuators
-    Turning_SetAngle(steering);
-    SetEscSpeed(throttle);
 }
 
 bool isWaypointReachable(float car_x, float car_y, float car_yaw, float wp_x, float wp_y) {
@@ -586,7 +645,41 @@ MotorControl computeWaypointControl(const PseudoGPS* gps, const Waypoint2D* wayp
     return control;
 }
 
+void differentialToAckermann(float omega, bool reset, float* throttle, float* steering) {
+    static int32_t baseEncoderPosition = 0;
+    static bool movingForward = true;  // Current movement direction
+    const int32_t danceAmplitude = 500;  // How far to move from baseline
+    const float throttleStrength = 0.8f;  // Base throttle magnitude
+    
+    if (reset) {
+        baseEncoderPosition = readEncoder();
+        movingForward = true;  // Start by moving forward
+    }
+    
+    int32_t currentPosition = readEncoder();
+    int32_t delta = currentPosition - baseEncoderPosition;
+    
+    // Switch direction based on current position
+    if (movingForward && delta >= danceAmplitude) {
+        movingForward = false;
+    } else if (!movingForward && delta <= -danceAmplitude) {
+        movingForward = true;
+    }
+    
+    // Set throttle based on direction
+    *throttle = movingForward ? throttleStrength : -throttleStrength;
+    *steering = movingForward ? omega : -omega;
+}
+
 // LOOP FUNCTIONS
+void ActuatorDebugLoop() {
+	MotorControl dbg_control = {0.0f, 0.0f, 0.0f};  // {throttle, steering, omega}
+
+	while (1) {
+		applyMotorControl(&dbg_control);
+	}
+}
+
 void loopPrintAllCAN(void)
 {
     FDCAN_RxHeaderTypeDef RxHeader;
@@ -659,32 +752,50 @@ void loopPrintAll(void) {
         // Drain CAN FIFO once per loop iteration
         drainAndUpdateCANMessages();
 
-        // Read current position
-        PseudoGPS gps;
-        bool hasGPS = readPseudoGPS(&gps);
-
-        // Read motor control and waypoint commands
-        MotorControl control = {0.0f, 0.0f, 0.0f};
-        readMotorControl(&control);
-        
-        Waypoint2D waypoint;
-        readWaypoint2D(&waypoint);
-
-        // Apply control based on current mode
-        if (currentMode == MODE_WAYPOINT && hasGPS) {
-            // Navigate to waypoint
-            control = computeWaypointControl(&gps, &waypoint);
+        // 1) Apply motor control commands
+        MotorControl control;
+        if (readMotorControl(&control)) {
+            applyMotorControl(&control);
         }
-        
-        // Apply motor control (handles both manual and waypoint modes)
-        applyMotorControl(&control);
+
+        // 1b) Read waypoint commands (just reception for now)
+        Waypoint2D waypoint;
+        if (readWaypoint2D(&waypoint)) {
+            // Waypoint received - TODO: implement navigation logic
+        }
 
         // 2) Periodically print all values
         if (now - lastPrint >= printIntervalMs)
         {
             int32_t encoderCount = readEncoder();
+            Orientation orient;
+            AngularVelocity angvel;
+            LinearAcceleration accel;
+            PseudoGPS gps;
+            bool hasOrientation = readOrientation(&orient);
+            bool hasAngvel = readAngularVelocity(&angvel);
+            bool hasAccel = readLinearAcceleration(&accel);
+            bool hasGPS = readPseudoGPS(&gps);
 
             printf("Enc:%8ld | ", (long)encoderCount);
+            
+            if (hasOrientation) {
+                printf("R:%6.2f P:%6.2f Y:%6.2f | ", orient.roll, orient.pitch, orient.yaw);
+            } else {
+                printf("Orient:[No data] | ");
+            }
+
+            if (hasAngvel) {
+                printf("Gx:%+6.1f Gy:%+6.1f Gz:%+6.1f | ", angvel.gx, angvel.gy, angvel.gz);
+            } else {
+                printf("Angvel:[No data] | ");
+            }
+
+            if (hasAccel) {
+                printf("Ax:%+5.2f Ay:%+5.2f Az:%+5.2f | ", accel.ax, accel.ay, accel.az);
+            } else {
+                printf("Accel:[No data] | ");
+            }
 
             if (hasGPS) {
                 printf("GPS X:%5.0f Y:%5.0f W:%5.0f | ", gps.x, gps.y, gps.w);
@@ -693,8 +804,7 @@ void loopPrintAll(void) {
             }
 
             printf("T:%+5.2f S:%+5.2f W:%+5.2f | ", control.throttle, control.steering, control.omega);
-            printf("WP X:%5.1f Y:%5.1f O:%5.1f | ", waypoint.x, waypoint.y, waypoint.omega);
-            printf("Mode:%s\n\r", (currentMode == MODE_MANUAL) ? "MAN" : "WAY");
+            printf("WP X:%5.1f Y:%5.1f O:%5.1f\n\r", waypoint.x, waypoint.y, waypoint.omega);
 
             lastPrint = now;
         }
@@ -846,7 +956,12 @@ Error_Handler();
   HAL_Delay(500);
 //  loopPrintAllCAN();
   loopPrintAll();
-//    navigationLoop();
+//  ActuatorDebugLoop();
+//  loopPrintUnwrapped();
+//  waypointLoop();
+//  waypoint2DLoop();
+//  loopPrintPseudoGPS();
+//  navigationLoop();
 //  loopSpinInPlace();
   /* USER CODE END 2 */
 

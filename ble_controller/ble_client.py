@@ -18,7 +18,6 @@ def load_scales():
 
 def to_byte(val):
     # Convert -1.0 to +1.0 range to 0-255 byte
-    # Matches C toBipolar: (value - 128) / 128.0
     result = int(val * 128.0 + 128.0)
     return max(0, min(255, result))
 
@@ -123,6 +122,7 @@ async def control_loop():
     await car.connect()
     
     try:
+        pass # Place breakpoint here for console commands
         while True:
             THROTTLE_SCALE, STEERING_SCALE, OMEGA_SCALE = load_scales()
             
@@ -148,19 +148,9 @@ async def control_loop():
     finally:
         await car.disconnect()
 
-async def debug_loop():
-    car = CarBLEClient()
-    await car.connect()
-    
-    try:
-        pass # Set a breakpoint here to debug
-    finally:
-        await car.disconnect()
-
 if __name__ == "__main__":
     try:
         asyncio.run(control_loop())
-        # asyncio.run(debug_loop())
     except KeyboardInterrupt:
         print("Interrupted")
     except Exception as e:
