@@ -80,15 +80,6 @@ uint8_t waypointBuffer[6] = {0};  // x (2 bytes), y (2 bytes), omega (2 bytes)
 unsigned long lastWaypointTxTime = 0;
 bool waypointChanged = false;
 
-// Dead Reckoning variables
-const float ENCODER_COUNTS_PER_METER = 16066.0f;
-const unsigned long ENCODER_MOVEMENT_TIMEOUT = 100;  // ms - only update yaw when encoder moved recently
-float deadReckonX = 0.0f;      // Dead reckoning X position (pixels, matching camera coordinate system)
-float deadReckonY = 0.0f;      // Dead reckoning Y position (pixels)
-float deadReckonYaw = 0.0f;    // Dead reckoning yaw (degrees, 0-360)
-long lastEncoderCount = 0;
-unsigned long lastEncoderChangeTime = 0;
-
 // BLE Callback functions
 void onLedControl(uint8_t* data, size_t len) {
   if (data[0] > 0) {
@@ -306,94 +297,8 @@ void sendLinearAccelCAN(float ax, float ay, float az) {
   CAN0.sendMsgBuf(0x127, 0, 8, accelData);
 }
 
-bool isCamAvailable() {
-  // Check if we're receiving camera data via BLE
-  if (!bleClientIsConnected()) {
-    return false;  // Not connected to camera server
-  }
-  
-  // Check if data has been received recently (within last 500ms)
-  unsigned long timeSinceLastData = bleClientTimeSinceLastData();
-  if (timeSinceLastData == 0 || timeSinceLastData > 500) {
-    return false;  // No data or data too old
-  }
-  
-  // Check if latest data is all 0xFF (camera lost tracking)
-  uint8_t tempBuffer[8];
-  bleClientGetData(tempBuffer);
-  
-  bool allFF = true;
-  for (int i = 0; i < 8; i++) {
-    if (tempBuffer[i] != 0xFF) {
-      allFF = false;
-      break;
-    }
-  }
-  
-  // Camera is available if we have recent data that's NOT all 0xFF
-  return !allFF;
-}
-
-void updateDeadReckoning(long currentEncoderCount, float currentYaw) {
-  // Check if encoder has moved recently
-  bool encoderMoved = (currentEncoderCount != lastEncoderCount);
-  unsigned long now = millis();
-  
-  if (encoderMoved) {
-    lastEncoderChangeTime = now;
-  }
-  
-  // Only update yaw if encoder is moving or moved recently (reduces IMU drift)
-  bool allowYawUpdate = (now - lastEncoderChangeTime) <= ENCODER_MOVEMENT_TIMEOUT;
-  
-  if (allowYawUpdate) {
-    // Update yaw from IMU (normalized to 0-360 range)
-    deadReckonYaw = currentYaw;
-    while (deadReckonYaw < 0) deadReckonYaw += 360;
-    while (deadReckonYaw >= 360) deadReckonYaw -= 360;
-  }
-  
-  // Calculate distance traveled since last update
-  long deltaEncoder = currentEncoderCount - lastEncoderCount;
-  float distanceMeters = deltaEncoder / ENCODER_COUNTS_PER_METER;
-  
-  // Convert yaw to radians for trigonometry
-  float yawRadians = deadReckonYaw * PI / 180.0f;
-  
-  // Update position based on distance and heading
-  // Assuming camera coordinates: positive X is right, positive Y is down
-  // and yaw=0 points right (needs adjustment based on your coordinate system)
-  deadReckonX += distanceMeters * cos(yawRadians) * 100.0f;  // Convert meters to cm for consistency
-  deadReckonY += distanceMeters * sin(yawRadians) * 100.0f;
-  
-  lastEncoderCount = currentEncoderCount;
-}
-
-void resetDeadReckoning(float camX, float camY, float camYaw) {
-  // Reset dead reckoning to camera position when camera is available
-  deadReckonX = camX;
-  deadReckonY = camY;
-  deadReckonYaw = camYaw;
-  
-  // Reset encoder baseline
-  noInterrupts();
-  lastEncoderCount = encoderPosition;
-  interrupts();
-  lastEncoderChangeTime = millis();
-}
-
 void sendCameraPositionCAN(const uint8_t* data) {
-  // This function now sends hybrid positioning data:
-  // - Camera data when available
-  // - Dead reckoning when camera is lost
-  
-  // The data buffer will be filled based on source
-  // Format remains the same as camera (big-endian):
-  // Bytes 0-1: unused/flags
-  // Bytes 2-3: X position (big-endian uint16_t)
-  // Bytes 4-5: Y position (big-endian uint16_t)
-  // Bytes 6-7: Yaw/Width (big-endian uint16_t)
-  
+  // Copy camera data to CAN buffer
   for (int i = 0; i < 8; i++) {
     cameraData[i] = data[i];
   }
@@ -402,7 +307,7 @@ void sendCameraPositionCAN(const uint8_t* data) {
   byte sndStat = CAN0.sendMsgBuf(0x128, 0, 8, cameraData);
   
   if (sndStat == CAN_OK) {
-    Serial.print("Position CAN TX: ");
+    Serial.print("Camera CAN TX: ");
     for (int i = 0; i < 8; i++) {
       Serial.print("0x");
       if (cameraData[i] < 0x10) Serial.print("0");
@@ -496,70 +401,17 @@ void loop() {
   // ========== BLE CAMERA CLIENT UPDATE ==========
   bleClientUpdate();
   
-  // ========== HYBRID POSITIONING (Camera + Dead Reckoning) ==========
-  static bool wasCamAvailable = false;
-  bool camAvailable = isCamAvailable();
-  
-  // Get current encoder position
-  long currentEncoderPos;
-  noInterrupts();
-  currentEncoderPos = encoderPosition;
-  interrupts();
-  
-  // Update dead reckoning with current encoder and yaw
-  updateDeadReckoning(currentEncoderPos, yaw);
-  
-  // Prepare position data buffer
-  uint8_t positionBuffer[8] = {0};
-  
-  if (camAvailable) {
-    // Camera is available - use camera data and reset dead reckoning
-    uint8_t cameraBuffer[8];
-    bleClientGetData(cameraBuffer);
+  // ========== CAMERA DATA CAN TX (Event + Periodic) ==========
+  if (bleClientIsConnected()) {
+    bool cameraDueByTimeout = (now - lastCameraTxTime >= CAMERA_INTERVAL);
     
-    // Extract camera position (big-endian format)
-    uint16_t cam_x = ((uint16_t)cameraBuffer[2] << 8) | (uint16_t)cameraBuffer[3];
-    uint16_t cam_y = ((uint16_t)cameraBuffer[4] << 8) | (uint16_t)cameraBuffer[5];
-    uint16_t cam_w = ((uint16_t)cameraBuffer[6] << 8) | (uint16_t)cameraBuffer[7];
-    
-    // Reset dead reckoning to camera position (on transition to available)
-    if (!wasCamAvailable) {
-      resetDeadReckoning((float)cam_x, (float)cam_y, (float)cam_w);
-      Serial.println("⚠ Camera restored - resetting dead reckoning");
+    if (bleClientHasNewData() || cameraDueByTimeout) {
+      lastCameraTxTime = now;
+      uint8_t cameraBuffer[8];
+      if (bleClientGetData(cameraBuffer)) {
+        sendCameraPositionCAN(cameraBuffer);
+      }
     }
-    
-    // Use camera data directly
-    memcpy(positionBuffer, cameraBuffer, 8);
-    
-  } else {
-    // Camera lost - use dead reckoning
-    if (wasCamAvailable) {
-      Serial.println("⚠ Camera lost - switching to dead reckoning");
-    }
-    
-    // Encode dead reckoning position in same format as camera (big-endian)
-    uint16_t dr_x = (uint16_t)deadReckonX;
-    uint16_t dr_y = (uint16_t)deadReckonY;
-    uint16_t dr_w = (uint16_t)deadReckonYaw;
-    
-    positionBuffer[0] = 0;  // Flags/unused
-    positionBuffer[1] = 0;
-    positionBuffer[2] = (dr_x >> 8) & 0xFF;  // X high byte
-    positionBuffer[3] = dr_x & 0xFF;         // X low byte
-    positionBuffer[4] = (dr_y >> 8) & 0xFF;  // Y high byte
-    positionBuffer[5] = dr_y & 0xFF;         // Y low byte
-    positionBuffer[6] = (dr_w >> 8) & 0xFF;  // Yaw high byte
-    positionBuffer[7] = dr_w & 0xFF;         // Yaw low byte
-  }
-  
-  wasCamAvailable = camAvailable;
-  
-  // ========== POSITION CAN TX (Event + Periodic) ==========
-  bool positionDueByTimeout = (now - lastCameraTxTime >= CAMERA_INTERVAL);
-  
-  if (bleClientHasNewData() || positionDueByTimeout) {
-    lastCameraTxTime = now;
-    sendCameraPositionCAN(positionBuffer);
   }
   
   // ========== IMU READS (Every loop, ~100Hz) ==========
