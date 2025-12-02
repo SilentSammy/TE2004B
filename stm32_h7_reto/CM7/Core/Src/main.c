@@ -18,6 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
+#include "robot_types.h"
+#include "can.h"
+#include "sensors.h"
+#include "actuators.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -33,36 +38,7 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef struct {
-    uint32_t id;           // CAN identifier (11-bit standard or 29-bit extended)
-    uint8_t  data[64];     // Payload (supports CAN-FD up to 64 bytes)
-    uint8_t  length;       // Actual data length in bytes
-    uint32_t timestamp;    // When message was received (HAL_GetTick())
-    bool     isExtended;   // true = 29-bit extended ID, false = 11-bit extended
-} CANMessage;
 
-typedef struct {
-    float throttle;  // Throttle value (-1.0 to +1.0)
-    float steering;  // Steering value (-1.0 to +1.0)
-    float omega;     // Omega (angular velocity) value
-} MotorControl;
-
-typedef struct {
-    float x;     // X position in meters
-    float y;     // Y position in meters
-    float w; // Angle (omega) in degrees
-} PseudoGPS;
-
-typedef struct {
-    float x;            // Target X coordinate
-    float y;            // Target Y coordinate
-    float omega;        // Target orientation in degrees
-} Waypoint2D;
-
-typedef enum {
-    MODE_MANUAL,      // Direct control via throttle/steering/omega
-    MODE_WAYPOINT     // Autonomous waypoint navigation
-} ControlMode;
 
 /* USER CODE END PTD */
 
@@ -98,8 +74,15 @@ TIM_HandleTypeDef htim14;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* USER CODE BEGIN PV */
-static ControlMode currentMode = MODE_MANUAL;  // Default to manual
+ControlMode currentMode = MODE_MANUAL;  // Default to manual
 FDCAN_FilterTypeDef sFilterConfig;
 FDCAN_TxHeaderTypeDef TxHeader;
 FDCAN_RxHeaderTypeDef RxHeader;
@@ -116,7 +99,7 @@ CANMessage latestMsgs[] = {
     {.id = 0x128, .length = 0, .timestamp = 0, .isExtended = false},   // Pseudo-GPS
     {.id = 0x129, .length = 0, .timestamp = 0, .isExtended = false}   // Waypoint2D
 };
-#define NUM_CAN_IDS (sizeof(latestMsgs) / sizeof(latestMsgs[0]))
+const uint8_t NUM_CAN_IDS = sizeof(latestMsgs) / sizeof(latestMsgs[0]);
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -127,72 +110,14 @@ static void MX_FDCAN1_Init(void);
 static void MX_TIM13_Init(void);
 static void MX_TIM14_Init(void);
 static void MX_USART2_UART_Init(void);
+void StartDefaultTask(void *argument);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// MOTORS AND SERVOS
-void Turning_SetAngle(float steer)
-{
-    /* 0) Preprocess normalized input (-1..1) → (-90..90 degrees) */
-    float angle = steer * 90.0f;
-
-	/* 1) Clamp input */
-    if (angle < -90.0f) angle = -90.0f;
-    if (angle >  90.0f) angle =  90.0f;
-
-    /* 2) Map to pulse width in microseconds */
-    float pulseWidth = 1000.0f + (angle * 1000.0f) / 180.0f;   // 1000..2000 us
-
-    /* 3) Convert to compare value and clamp to ARR */
-    uint32_t arr   = __HAL_TIM_GET_AUTORELOAD(&htim13);        // e.g., 19999 for 20 ms frame
-    int32_t  value = (int32_t)lroundf(pulseWidth);             // round to nearest tick
-
-    if (value < 0) value = 0;
-    if ((uint32_t)value > arr) value = (int32_t)arr;
-
-    /* 4) Write compare register */
-    __HAL_TIM_SET_COMPARE(&htim13, TIM_CHANNEL_1, (uint32_t)value);
-}
-
-void SetEscSpeed(float value)
-{
-    /* 1) Clamp input range */
-    if (value < -1.0f) value = -1.0f;
-    if (value >  2.0f) value =  2.0f;
-
-    /* 2) Adjust asymmetry:
-          Forward (positive) -> halve output
-          Reverse (negative) -> unchanged */
-    if (value > 0.0f)
-        value *= 0.5f;
-
-    /* 3) Map to pulse width (µs)
-          -1 → 1000 µs
-           0 → 1500 µs
-          +1 → 2000 µs
-    */
-    float pulseWidth = 1500.0f + (value * 500.0f);
-
-    /* 4) Convert µs to timer ticks (1 tick = 1 µs assumed) */
-    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim14);
-    int32_t ticks = (int32_t)lroundf(pulseWidth);
-
-    /* 5) Clamp within timer range */
-    if (ticks < 0) ticks = 0;
-    if ((uint32_t)ticks > arr) ticks = (int32_t)arr;
-
-    /* 6) Apply PWM */
-    __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, (uint32_t)ticks);
-}
-
-void StopCarEsc(void)
-{
-    SetEscSpeed(0.0f);   // Neutral = 1500 µs pulse
-}
-
 void debugLoop() {
 	float dbg_spd = 0.5f;
 	float dbg_str = 0.0f;
@@ -202,177 +127,6 @@ void debugLoop() {
 		Turning_SetAngle(dbg_str);
 		StopCarEsc();
 	}
-}
-
-// CAN FUNCTIONS
-static inline uint8_t dlc_to_bytes(uint32_t dlc) {
-    static const uint8_t map[16] = {0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64};
-    return (dlc < 16) ? map[dlc] : 0;
-}
-
-int drainAndUpdateCANMessages(void)
-{
-    FDCAN_RxHeaderTypeDef RxHeader;
-    uint8_t RxData[64];
-    HAL_StatusTypeDef status;
-    int totalFramesRead = 0;
-
-    // Drain entire FIFO, update matching IDs
-    do {
-        status = HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &RxHeader, RxData);
-        if (status == HAL_OK) {
-            totalFramesRead++;
-
-            // Check if this ID is in our tracking list
-            for (uint8_t i = 0; i < NUM_CAN_IDS; i++) {
-                bool idMatches = (RxHeader.Identifier == latestMsgs[i].id);
-                bool typeMatches = ((RxHeader.IdType == FDCAN_STANDARD_ID) && !latestMsgs[i].isExtended) ||
-                                   ((RxHeader.IdType == FDCAN_EXTENDED_ID) && latestMsgs[i].isExtended);
-
-                if (idMatches && typeMatches) {
-                    // Update this message slot
-                    uint32_t raw = RxHeader.DataLength;
-                    uint8_t len = (raw <= 64) ? (uint8_t)raw : dlc_to_bytes(raw >> 16);
-
-                    latestMsgs[i].length = len;
-                    latestMsgs[i].timestamp = HAL_GetTick();
-                    memcpy(latestMsgs[i].data, RxData, len);
-                    break;  // Found match, no need to check other slots
-                }
-            }
-        }
-    } while (status == HAL_OK);
-
-    return totalFramesRead;
-}
-
-CANMessage* getCANMessageByID(uint32_t id)
-{
-    for (uint8_t i = 0; i < NUM_CAN_IDS; i++) {
-        if (latestMsgs[i].id == id) {
-            return &latestMsgs[i];
-        }
-    }
-    return NULL;  // ID not tracked
-}
-
-int32_t readEncoder(void)
-{
-    static int32_t lastPosition = 0;
-
-    // Get the encoder message from latestMsgs array
-    CANMessage* encoderMsg = getCANMessageByID(0x123);
-    if (encoderMsg != NULL && encoderMsg->length >= 4) {
-        memcpy(&lastPosition, encoderMsg->data, sizeof(lastPosition));
-    }
-
-    return lastPosition;
-}
-
-bool readMotorControl(MotorControl* control)
-{
-    static MotorControl lastControl = {0.0f, 0.0f, 0.0f};
-    static MotorControl previousControl = {0.0f, 0.0f, 0.0f};
-
-    if (control == NULL) {
-        return false;  // Invalid pointer
-    }
-
-    // Get the motor control message from latestMsgs array
-    CANMessage* controlMsg = getCANMessageByID(0x125);
-    if (controlMsg != NULL && controlMsg->length >= 6) {
-        // Decode throttle (bytes 0-1), steering (bytes 2-3), omega (bytes 4-5)
-        int16_t throttleRaw = (int16_t)((uint16_t)controlMsg->data[0] | ((uint16_t)controlMsg->data[1] << 8));
-        int16_t steeringRaw = (int16_t)((uint16_t)controlMsg->data[2] | ((uint16_t)controlMsg->data[3] << 8));
-        int16_t omegaRaw = (int16_t)((uint16_t)controlMsg->data[4] | ((uint16_t)controlMsg->data[5] << 8));
-
-        // Convert to normalized float (-1.0 to +1.0)
-        lastControl.throttle = throttleRaw / 1000.0f;
-        lastControl.throttle *= 2;
-        lastControl.steering = steeringRaw / 1000.0f;
-        lastControl.omega = omegaRaw / 1000.0f;
-        
-        // Check if control values changed - switch to MANUAL mode if so
-        if (lastControl.throttle != previousControl.throttle ||
-            lastControl.steering != previousControl.steering ||
-            lastControl.omega != previousControl.omega) {
-            currentMode = MODE_MANUAL;
-            previousControl = lastControl;
-        }
-    }
-
-    // Copy to output
-    *control = lastControl;
-
-    // Return true if we have valid data (timestamp > 0 means we received at least one message)
-    return (controlMsg != NULL && controlMsg->timestamp > 0);
-}
-
-bool readWaypoint2D(Waypoint2D* waypoint)
-{
-    static Waypoint2D lastWaypoint = {0.0f, 0.0f, 0.0f};
-    static Waypoint2D previousWaypoint = {0.0f, 0.0f, 0.0f};
-
-    if (waypoint == NULL) {
-        return false;  // Invalid pointer
-    }
-
-    // Get the waypoint message from latestMsgs array
-    CANMessage* waypointMsg = getCANMessageByID(0x129);
-    if (waypointMsg != NULL && waypointMsg->length >= 6) {
-        // Decode x (bytes 0-1), y (bytes 2-3), omega (bytes 4-5) - little-endian
-        int16_t x_mm = (int16_t)((uint16_t)waypointMsg->data[0] | ((uint16_t)waypointMsg->data[1] << 8));
-        int16_t y_mm = (int16_t)((uint16_t)waypointMsg->data[2] | ((uint16_t)waypointMsg->data[3] << 8));
-        int16_t omega_dec = (int16_t)((uint16_t)waypointMsg->data[4] | ((uint16_t)waypointMsg->data[5] << 8));
-
-        // Convert to float (mm → cm, decidegrees → degrees)
-        lastWaypoint.x = x_mm / 10.0f;
-        lastWaypoint.y = y_mm / 10.0f;
-        lastWaypoint.omega = omega_dec / 10.0f;
-        
-        // Check if waypoint values changed - switch to WAYPOINT mode if so
-        if (lastWaypoint.x != previousWaypoint.x ||
-            lastWaypoint.y != previousWaypoint.y ||
-            lastWaypoint.omega != previousWaypoint.omega) {
-            currentMode = MODE_WAYPOINT;
-            previousWaypoint = lastWaypoint;
-        }
-    }
-
-    // Copy to output
-    *waypoint = lastWaypoint;
-
-    // Return true if we have valid data
-    return (waypointMsg != NULL && waypointMsg->timestamp > 0);
-}
-
-bool readPseudoGPS(PseudoGPS* gps)
-{
-    static PseudoGPS lastGPS = {0.0f, 0.0f, 0.0f};
-
-    if (gps == NULL) {
-        return false;
-    }
-
-    // Get the pseudo-GPS message from latestMsgs array
-    CANMessage* gpsMsg = getCANMessageByID(0x128);
-    if (gpsMsg != NULL && gpsMsg->length >= 8) {
-        // Decode big-endian format (MSB first)
-        // X Position: bytes 2-3
-        uint16_t x_raw = ((uint16_t)gpsMsg->data[2] << 8) | (uint16_t)gpsMsg->data[3];
-        // Y Position: bytes 4-5
-        uint16_t y_raw = ((uint16_t)gpsMsg->data[4] << 8) | (uint16_t)gpsMsg->data[5];
-        // Width: bytes 6-7 (using as omega/angle)
-        uint16_t w_raw = ((uint16_t)gpsMsg->data[6] << 8) | (uint16_t)gpsMsg->data[7];
-
-        // Convert to float (pixels or appropriate units)
-        lastGPS.x = (float)x_raw;
-        lastGPS.y = (float)y_raw;
-        lastGPS.w = (float)w_raw;
-    }
-
-    *gps = lastGPS;
-    return (gpsMsg != NULL && gpsMsg->timestamp > 0);
 }
 
 // HELPERS
@@ -644,7 +398,7 @@ void loopSpinInPlace(void) {
     }
 }
 
-void loopPrintAll(void) {
+void loopPrintAll(void *argument) {
     const uint32_t printIntervalMs = 100;
     const uint32_t heartbeatIntervalMs = 1000;
     uint32_t lastPrint = HAL_GetTick();
@@ -845,10 +599,46 @@ Error_Handler();
   SetEscSpeed(0);
   HAL_Delay(500);
 //  loopPrintAllCAN();
-  loopPrintAll();
+//  loopPrintAll();
 //    navigationLoop();
 //  loopSpinInPlace();
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(loopPrintAll, NULL, &defaultTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -1251,6 +1041,46 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM7 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM7)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
