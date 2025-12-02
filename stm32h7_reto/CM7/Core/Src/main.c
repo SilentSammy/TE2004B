@@ -291,7 +291,7 @@ bool readMotorControl(MotorControl* control)
         lastControl.throttle *= 2;
         lastControl.steering = steeringRaw / 1000.0f;
         lastControl.omega = omegaRaw / 1000.0f;
-        
+
         // Check if control values changed - switch to MANUAL mode if so
         if (lastControl.throttle != previousControl.throttle ||
             lastControl.steering != previousControl.steering ||
@@ -329,7 +329,7 @@ bool readWaypoint2D(Waypoint2D* waypoint)
         lastWaypoint.x = x_mm / 10.0f;
         lastWaypoint.y = y_mm / 10.0f;
         lastWaypoint.omega = omega_dec / 10.0f;
-        
+
         // Check if waypoint values changed - switch to WAYPOINT mode if so
         if (lastWaypoint.x != previousWaypoint.x ||
             lastWaypoint.y != previousWaypoint.y ||
@@ -409,22 +409,22 @@ void differentialToAckermann(float omega, bool reset, float* throttle, float* st
     static bool movingForward = true;  // Current movement direction
     const int32_t danceAmplitude = 500;  // How far to move from baseline
     const float throttleStrength = 0.8f;  // Base throttle magnitude
-    
+
     int32_t currentPosition = readEncoder();
     if (reset) {
         baseEncoderPosition = currentPosition;
         movingForward = true;  // Start by moving forward
     }
-    
+
     int32_t delta = currentPosition - baseEncoderPosition;
-    
+
     // Switch direction based on current position
     if (movingForward && delta >= danceAmplitude) {
         movingForward = false;
     } else if (!movingForward && delta <= -danceAmplitude) {
         movingForward = true;
     }
-    
+
     // Set throttle based on direction
     *throttle = movingForward ? throttleStrength : -throttleStrength;
     *steering = movingForward ? omega : -omega;
@@ -432,11 +432,11 @@ void differentialToAckermann(float omega, bool reset, float* throttle, float* st
 
 void applyMotorControl(const MotorControl* control) {
     static bool differentialInitialized = false;
-    
+
     if (control == NULL) return;
-    
+
     float throttle, steering;
-    
+
     // Check if omega is non-zero (use differential drive mode)
     if (control->omega != 0.0f) {
         // Use differential to Ackermann conversion
@@ -448,7 +448,7 @@ void applyMotorControl(const MotorControl* control) {
         steering = control->steering;
         differentialInitialized = false;  // Reset for next differential mode entry
     }
-    
+
     // Apply to actuators
     Turning_SetAngle(steering);
     SetEscSpeed(throttle);
@@ -666,7 +666,7 @@ void loopPrintAll(void) {
         // Read motor control and waypoint commands
         MotorControl control = {0.0f, 0.0f, 0.0f};
         readMotorControl(&control);
-        
+
         Waypoint2D waypoint;
         readWaypoint2D(&waypoint);
 
@@ -675,7 +675,7 @@ void loopPrintAll(void) {
             // Navigate to waypoint
             control = computeWaypointControl(&gps, &waypoint);
         }
-        
+
         // Apply motor control (handles both manual and waypoint modes)
         applyMotorControl(&control);
 
