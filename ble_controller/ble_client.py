@@ -97,24 +97,38 @@ class CarBLEClient:
         ]
     
         await self.set_char(self.base_uuid + "5", data, force=True)
+        
+        # Clear control value caches to force mode switch on next control send
+        self._clear_control_cache()
 
     async def set_led(self, state):
         await self.set_char(self.base_uuid + "1", int(state))
     
-    async def set_throttle(self, throttle):
+    async def set_throttle(self, throttle, force_mode_switch=False):
         """Set throttle (-1.0 to 1.0)"""
         mapped = to_byte(throttle)
-        await self.set_char(self.base_uuid + "2", mapped)
+        await self.set_char(self.base_uuid + "2", mapped, force=force_mode_switch)
     
-    async def set_steering(self, steering):
+    async def set_steering(self, steering, force_mode_switch=False):
         """Set steering (-1.0 to 1.0)"""
         mapped = to_byte(steering)
-        await self.set_char(self.base_uuid + "3", mapped)
+        await self.set_char(self.base_uuid + "3", mapped, force=force_mode_switch)
     
-    async def set_omega(self, omega):
+    async def set_omega(self, omega, force_mode_switch=False):
         """Set omega (-1.0 to 1.0)"""
         mapped = to_byte(omega)
-        await self.set_char(self.base_uuid + "4", mapped)
+        await self.set_char(self.base_uuid + "4", mapped, force=force_mode_switch)
+    
+    def _clear_control_cache(self):
+        """Clear cached control values to force next control send (for mode switching)"""
+        control_uuids = [
+            self.base_uuid + "2",  # throttle
+            self.base_uuid + "3",  # steering
+            self.base_uuid + "4"   # omega
+        ]
+        for uuid in control_uuids:
+            self._cached_char_values.pop(uuid, None)
+            self._cached_char_timestamps.pop(uuid, None)
 
 async def control_loop():
     import combined_input as inp
@@ -122,7 +136,6 @@ async def control_loop():
     await car.connect()
     
     try:
-        pass # Place breakpoint here for console commands
         while True:
             THROTTLE_SCALE, STEERING_SCALE, OMEGA_SCALE = load_scales()
             

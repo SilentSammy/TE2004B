@@ -114,7 +114,8 @@ CANMessage latestMsgs[] = {
     {.id = 0x126, .length = 0, .timestamp = 0, .isExtended = false},  // Angular Velocity
 	{.id = 0x127, .length = 0, .timestamp = 0, .isExtended = false},   // Linear Acceleration
     {.id = 0x128, .length = 0, .timestamp = 0, .isExtended = false},   // Pseudo-GPS
-    {.id = 0x129, .length = 0, .timestamp = 0, .isExtended = false}   // Waypoint2D
+    {.id = 0x129, .length = 0, .timestamp = 0, .isExtended = false},   // Waypoint2D
+    {.id = 0x130, .length = 0, .timestamp = 0, .isExtended = false}    // Control Mode
 };
 #define NUM_CAN_IDS (sizeof(latestMsgs) / sizeof(latestMsgs[0]))
 /* USER CODE END PV */
@@ -272,7 +273,6 @@ int32_t readEncoder(void)
 bool readMotorControl(MotorControl* control)
 {
     static MotorControl lastControl = {0.0f, 0.0f, 0.0f};
-    static MotorControl previousControl = {0.0f, 0.0f, 0.0f};
 
     if (control == NULL) {
         return false;  // Invalid pointer
@@ -291,14 +291,6 @@ bool readMotorControl(MotorControl* control)
         lastControl.throttle *= 2;
         lastControl.steering = steeringRaw / 1000.0f;
         lastControl.omega = omegaRaw / 1000.0f;
-
-        // Check if control values changed - switch to MANUAL mode if so
-        if (lastControl.throttle != previousControl.throttle ||
-            lastControl.steering != previousControl.steering ||
-            lastControl.omega != previousControl.omega) {
-            currentMode = MODE_MANUAL;
-            previousControl = lastControl;
-        }
     }
 
     // Copy to output
@@ -311,7 +303,6 @@ bool readMotorControl(MotorControl* control)
 bool readWaypoint2D(Waypoint2D* waypoint)
 {
     static Waypoint2D lastWaypoint = {0.0f, 0.0f, 0.0f};
-    static Waypoint2D previousWaypoint = {0.0f, 0.0f, 0.0f};
 
     if (waypoint == NULL) {
         return false;  // Invalid pointer
@@ -329,14 +320,6 @@ bool readWaypoint2D(Waypoint2D* waypoint)
         lastWaypoint.x = x_mm / 10.0f;
         lastWaypoint.y = y_mm / 10.0f;
         lastWaypoint.omega = omega_dec / 10.0f;
-
-        // Check if waypoint values changed - switch to WAYPOINT mode if so
-        if (lastWaypoint.x != previousWaypoint.x ||
-            lastWaypoint.y != previousWaypoint.y ||
-            lastWaypoint.omega != previousWaypoint.omega) {
-            currentMode = MODE_WAYPOINT;
-            previousWaypoint = lastWaypoint;
-        }
     }
 
     // Copy to output
@@ -373,6 +356,25 @@ bool readPseudoGPS(PseudoGPS* gps)
 
     *gps = lastGPS;
     return (gpsMsg != NULL && gpsMsg->timestamp > 0);
+}
+
+bool readControlMode(ControlMode* mode)
+{
+    if (mode == NULL) {
+        return false;
+    }
+
+    // Get the mode message from latestMsgs array
+    CANMessage* modeMsg = getCANMessageByID(0x130);
+    if (modeMsg != NULL && modeMsg->length >= 1) {
+        // Decode mode from byte 0 (0=manual, 1=waypoint)
+        uint8_t modeValue = modeMsg->data[0];
+        *mode = (modeValue == 0) ? MODE_MANUAL : MODE_WAYPOINT;
+        return true;
+    }
+
+    // No mode data received - keep current mode
+    return false;
 }
 
 // HELPERS
@@ -658,6 +660,12 @@ void loopPrintAll(void) {
 
         // Drain CAN FIFO once per loop iteration
         drainAndUpdateCANMessages();
+
+        // Read control mode from CAN (updates currentMode)
+        ControlMode receivedMode;
+        if (readControlMode(&receivedMode)) {
+            currentMode = receivedMode;
+        }
 
         // Read current position
         PseudoGPS gps;

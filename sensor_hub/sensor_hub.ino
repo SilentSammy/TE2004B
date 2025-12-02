@@ -43,6 +43,7 @@ byte angvelData[8] = {0};                   // CAN message buffer (angular veloc
 byte accelData[8] = {0};                    // CAN message buffer (linear acceleration)
 byte cameraData[8] = {0};                   // CAN message buffer (camera position)
 byte waypointData[8] = {0};                 // CAN message buffer (waypoint)
+byte modeData[8] = {0};                     // CAN message buffer (mode: 0=manual, 1=waypoint)
 bool canInitialized = false;
 
 // Encoder variables (functions in encoder.ino)
@@ -68,6 +69,12 @@ float currentOmega = 0.0;     // -1.0 to 1.0
 unsigned long lastControlTxTime = 0;
 bool controlChanged = false;
 
+// Mode tracking (0=manual, 1=waypoint)
+uint8_t currentMode = 0;      // Default to manual mode
+bool modeChanged = false;
+unsigned long lastModeTxTime = 0;
+const unsigned long MODE_INTERVAL = 50;  // Send mode at 20Hz
+
 // BLE Waypoint variables
 uint8_t waypointBuffer[6] = {0};  // x (2 bytes), y (2 bytes), omega (2 bytes)
 unsigned long lastWaypointTxTime = 0;
@@ -87,6 +94,11 @@ void onLedControl(uint8_t* data, size_t len) {
 void onThrottleControl(uint8_t* data, size_t len) {
   currentThrottle = toBipolar(data[0]);
   controlChanged = true;
+  // Switch to manual mode
+  if (currentMode != 0) {
+    currentMode = 0;
+    modeChanged = true;
+  }
   if (DEBUG_BLE) {
     Serial.print("Throttle: ");
     Serial.println(currentThrottle, 3);
@@ -96,6 +108,11 @@ void onThrottleControl(uint8_t* data, size_t len) {
 void onSteeringControl(uint8_t* data, size_t len) {
   currentSteering = toBipolar(data[0]);
   controlChanged = true;
+  // Switch to manual mode
+  if (currentMode != 0) {
+    currentMode = 0;
+    modeChanged = true;
+  }
   if (DEBUG_BLE) {
     Serial.print("Steering: ");
     Serial.println(currentSteering, 3);
@@ -105,6 +122,11 @@ void onSteeringControl(uint8_t* data, size_t len) {
 void onOmegaControl(uint8_t* data, size_t len) {
   currentOmega = toBipolar(data[0]);
   controlChanged = true;
+  // Switch to manual mode
+  if (currentMode != 0) {
+    currentMode = 0;
+    modeChanged = true;
+  }
   if (DEBUG_BLE) {
     Serial.print("Omega: ");
     Serial.println(currentOmega, 3);
@@ -118,6 +140,11 @@ void onWaypointControl(uint8_t* data, size_t len) {
       waypointBuffer[i] = data[i];
     }
     waypointChanged = true;
+    // Switch to waypoint mode
+    if (currentMode != 1) {
+      currentMode = 1;
+      modeChanged = true;
+    }
     
     if (DEBUG_BLE) {
       // Optional: decode for debugging
@@ -211,6 +238,22 @@ void sendWaypointCAN() {
   
   if (DEBUG_BLE && sndStat == CAN_OK) {
     Serial.println("CAN Waypoint TX");
+  }
+}
+
+void sendModeCAN() {
+  // Pack mode into CAN message (0=manual, 1=waypoint)
+  modeData[0] = currentMode;
+  for (int i = 1; i < 8; i++) {
+    modeData[i] = 0;
+  }
+  
+  // Send on CAN ID 0x130
+  byte sndStat = CAN0.sendMsgBuf(0x130, 0, 8, modeData);
+  
+  if (DEBUG_BLE && sndStat == CAN_OK) {
+    Serial.print("CAN Mode TX: ");
+    Serial.println(currentMode == 0 ? "MANUAL" : "WAYPOINT");
   }
 }
 
@@ -417,6 +460,15 @@ void loop() {
     lastWaypointTxTime = now;
     waypointChanged = false;
     sendWaypointCAN();
+  }
+  
+  // ========== MODE CAN TX (Event + Periodic) ==========
+  bool modeDueByTimeout = (now - lastModeTxTime >= MODE_INTERVAL);
+  
+  if (modeChanged || modeDueByTimeout) {
+    lastModeTxTime = now;
+    modeChanged = false;
+    sendModeCAN();
   }
   
   // ========== ENCODER CAN TX (Variable rate) ==========
